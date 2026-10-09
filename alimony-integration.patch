@@ -1,0 +1,2484 @@
+diff --git a/backend/.env.example b/backend/.env.example
+new file mode 100644
+index 0000000..107b43f
+--- /dev/null
++++ b/backend/.env.example
+@@ -0,0 +1,8 @@
++# Copy to .env (never commit .env). Generate secrets with: openssl rand -hex 32
++DATABASE_URL=postgres://USER:PASSWORD@127.0.0.1:5432/alimony
++JWT_SECRET=
++# Must be 32 bytes as 64 hex characters
++FILE_ENCRYPTION_KEY=
++PORT=5000
++# Login attempts allowed per 15 minutes per IP (default 5; raise only for automated tests)
++LOGIN_RATE_LIMIT_MAX=5
+diff --git a/backend/.gitignore b/backend/.gitignore
+index bd6a1b7..804af23 100644
+--- a/backend/.gitignore
++++ b/backend/.gitignore
+@@ -1,3 +1,8 @@
+ node_modules/
+ .env
+ uploads/
++
++.agents/
++.claude/
++.cursor/
++.devin/
+diff --git a/backend/controllers/checklistController.js b/backend/controllers/checklistController.js
+new file mode 100644
+index 0000000..34a1da4
+--- /dev/null
++++ b/backend/controllers/checklistController.js
+@@ -0,0 +1,23 @@
++import { getOwnedCase } from "../utils/ownedCase.js";
++import { loadIntake } from "./intakeController.js";
++import { documentsForCase } from "./listDocumentsController.js";
++import { buildChecklist } from "../services/checklist.js";
++
++const checklistController = async (req, res) => {
++    try {
++        const { error, caseData } = await getOwnedCase(req.params.id, req.user.id);
++        if (error) return res.status(error.status).json({ success: false, message: error.message });
++        const intake = await loadIntake(caseData.id);
++        const documents = await documentsForCase(caseData.id, req.user.id);
++        res.status(200).json({
++            success: true,
++            intakeSaved: intake.saved,
++            checklist: buildChecklist(intake.answers, documents)
++        });
++    } catch (err) {
++        console.log("Checklist failed:", err.message);
++        res.status(500).json({ success: false, message: "Failed to build checklist" });
++    }
++};
++
++export default checklistController;
+diff --git a/backend/controllers/createPartycontroller.js b/backend/controllers/createPartyController.js
+similarity index 100%
+rename from backend/controllers/createPartycontroller.js
+rename to backend/controllers/createPartyController.js
+diff --git a/backend/controllers/downloadDocumentController.js b/backend/controllers/downloadDocumentController.js
+index 9147aba..44afb4f 100644
+--- a/backend/controllers/downloadDocumentController.js
++++ b/backend/controllers/downloadDocumentController.js
+@@ -3,6 +3,7 @@ import fs from "fs/promises";
+ import db from "../config/db.js";
+ import { decryptFile } from "../utils/encryption.js";
+ import setRlsUser from "../utils/rlsContext.js";
++import { ALLOWED_MIME } from "../utils/fileSignature.js";
+ 
+ const downloadDocument = async (req, res) => {
+     try {
+@@ -56,11 +57,19 @@ const downloadDocument = async (req, res) => {
+             authTag
+         );
+ 
+-        res.setHeader("Content-Type", document.mimeType);
++        const safeMime = ALLOWED_MIME.includes(document.mimeType)
++            ? document.mimeType
++            : "application/octet-stream";
++        const asciiName = String(document.originalName)
++            .replace(/[^\w.\- ]+/g, "_")
++            .slice(0, 120) || "document";
+ 
++        res.setHeader("Content-Type", safeMime);
++        res.setHeader("X-Content-Type-Options", "nosniff");
++        res.setHeader("Cache-Control", "no-store");
+         res.setHeader(
+             "Content-Disposition",
+-            `attachment; filename="${document.originalName}"`
++            `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(document.originalName)}`
+         );
+ 
+         res.send(decryptedFile);
+diff --git a/backend/controllers/intakeController.js b/backend/controllers/intakeController.js
+new file mode 100644
+index 0000000..7b25d75
+--- /dev/null
++++ b/backend/controllers/intakeController.js
+@@ -0,0 +1,59 @@
++import db from "../config/db.js";
++import createAuditLog from "../utils/auditLog.js";
++import { getOwnedCase } from "../utils/ownedCase.js";
++import { defaultIntake, validateIntake, isSafetyRisk } from "../services/intake.js";
++
++export const loadIntake = async (caseId) => {
++    const row = await db.orm.public.Intake.where({ caseId }).first();
++    if (!row) return { saved: false, answers: defaultIntake(), safetyFlag: false };
++    try {
++        return { saved: true, answers: { ...defaultIntake(), ...JSON.parse(row.answers) }, safetyFlag: row.safetyFlag };
++    } catch {
++        return { saved: false, answers: defaultIntake(), safetyFlag: false };
++    }
++};
++
++export const getIntake = async (req, res) => {
++    try {
++        const { error, caseData } = await getOwnedCase(req.params.id, req.user.id);
++        if (error) return res.status(error.status).json({ success: false, message: error.message });
++        const intake = await loadIntake(caseData.id);
++        res.status(200).json({ success: true, intake });
++    } catch (err) {
++        console.log("Intake read failed:", err.message);
++        res.status(500).json({ success: false, message: "Failed to get intake" });
++    }
++};
++
++export const saveIntake = async (req, res) => {
++    try {
++        const { error, caseData } = await getOwnedCase(req.params.id, req.user.id);
++        if (error) return res.status(error.status).json({ success: false, message: error.message });
++
++        const { errors, value } = validateIntake(req.body);
++        if (errors) return res.status(400).json({ success: false, message: errors[0], errors });
++
++        const safetyFlag = isSafetyRisk(value);
++        const answers = JSON.stringify(value);
++        const existing = await db.orm.public.Intake.where({ caseId: caseData.id }).first();
++        if (existing) {
++            await db.orm.public.Intake.where({ id: existing.id }).update({ answers, safetyFlag });
++        } else {
++            await db.orm.public.Intake.create({ caseId: caseData.id, userId: req.user.id, answers, safetyFlag });
++        }
++
++        // Never log the answers themselves: they are sensitive.
++        await createAuditLog({
++            userId: req.user.id,
++            action: "INTAKE_SAVED",
++            entityType: "Intake",
++            entityId: caseData.id,
++            metadata: `caseId=${caseData.id}`
++        });
++
++        res.status(200).json({ success: true, intake: { saved: true, answers: value, safetyFlag } });
++    } catch (err) {
++        console.log("Intake save failed:", err.message);
++        res.status(500).json({ success: false, message: "Failed to save intake" });
++    }
++};
+diff --git a/backend/controllers/listDocumentsController.js b/backend/controllers/listDocumentsController.js
+new file mode 100644
+index 0000000..5c321f1
+--- /dev/null
++++ b/backend/controllers/listDocumentsController.js
+@@ -0,0 +1,32 @@
++import db from "../config/db.js";
++import setRlsUser from "../utils/rlsContext.js";
++import { getOwnedCase } from "../utils/ownedCase.js";
++
++// Safe metadata only: never storage paths, file names on disk or file content.
++export const documentsForCase = async (caseId, userId) =>
++    db.transaction(async (tx) => {
++        await setRlsUser(tx, db, userId);
++        const rows = await tx.orm.public.Document.where((d) => d.caseId.eq(caseId)).all();
++        return rows.map((d) => ({
++            id: d.id,
++            caseId: d.caseId,
++            originalName: d.originalName,
++            documentType: d.documentType || "Other",
++            fileSize: d.fileSize,
++            createdAt: d.createdAt
++        }));
++    });
++
++const listDocuments = async (req, res) => {
++    try {
++        const { error, caseData } = await getOwnedCase(req.params.caseId, req.user.id);
++        if (error) return res.status(error.status).json({ success: false, message: error.message });
++        const documents = await documentsForCase(caseData.id, req.user.id);
++        res.status(200).json({ success: true, documents });
++    } catch (err) {
++        console.log("Document list failed:", err.message);
++        res.status(500).json({ success: false, message: "Failed to list documents" });
++    }
++};
++
++export default listDocuments;
+diff --git a/backend/controllers/navigatorController.js b/backend/controllers/navigatorController.js
+new file mode 100644
+index 0000000..56d9988
+--- /dev/null
++++ b/backend/controllers/navigatorController.js
+@@ -0,0 +1,21 @@
++import { getOwnedCase } from "../utils/ownedCase.js";
++import { loadIntake } from "./intakeController.js";
++import { buildNavigator } from "../services/legalRoutes.js";
++
++const navigatorController = async (req, res) => {
++    try {
++        const { error, caseData } = await getOwnedCase(req.params.id, req.user.id);
++        if (error) return res.status(error.status).json({ success: false, message: error.message });
++        const intake = await loadIntake(caseData.id);
++        res.status(200).json({
++            success: true,
++            intakeSaved: intake.saved,
++            navigator: buildNavigator(intake.answers)
++        });
++    } catch (err) {
++        console.log("Navigator failed:", err.message);
++        res.status(500).json({ success: false, message: "Failed to build legal routes" });
++    }
++};
++
++export default navigatorController;
+diff --git a/backend/controllers/uploadDocumentController.js b/backend/controllers/uploadDocumentController.js
+index 23de8a3..8b0749b 100644
+--- a/backend/controllers/uploadDocumentController.js
++++ b/backend/controllers/uploadDocumentController.js
+@@ -6,6 +6,9 @@ import db from "../config/db.js";
+ import { encryptFile } from "../utils/encryption.js";
+ import setRlsUser from "../utils/rlsContext.js";
+ import createAuditLog from "../utils/auditLog.js";
++import { getOwnedCase } from "../utils/ownedCase.js";
++import { matchesDeclaredType } from "../utils/fileSignature.js";
++import { DOCUMENT_TYPES } from "../services/checklist.js";
+ 
+ const uploadDocument = async (req, res) => {
+     let storagePath = null;
+@@ -29,6 +32,30 @@ const uploadDocument = async (req, res) => {
+             });
+         }
+ 
++        if (documentType !== undefined && !DOCUMENT_TYPES.includes(documentType)) {
++            return res.status(400).json({
++                success: false,
++                message: "Unknown document category"
++            });
++        }
++
++        // The declared type comes from the client, so check the file's own bytes.
++        if (!matchesDeclaredType(req.file.buffer, req.file.mimetype)) {
++            return res.status(400).json({
++                success: false,
++                message: "File content does not match its type"
++            });
++        }
++
++        // Verify ownership before anything is written to disk.
++        const owned = await getOwnedCase(numericCaseId, req.user.id);
++        if (owned.error) {
++            return res.status(owned.error.status).json({
++                success: false,
++                message: owned.error.message
++            });
++        }
++
+         const { encrypted, iv, authTag } = encryptFile(req.file.buffer);
+ 
+         const fileName = `${crypto.randomUUID()}.enc`;
+diff --git a/backend/middleware/authMiddleware.js b/backend/middleware/authMiddleware.js
+index 5398900..bcf3383 100644
+--- a/backend/middleware/authMiddleware.js
++++ b/backend/middleware/authMiddleware.js
+@@ -11,28 +11,23 @@ const authMiddleware = (req, res, next) => {
+             });
+         }
+ 
+-        const token = authHeader.split(" ")[1];
++        const [scheme, token] = authHeader.split(" ");
+ 
+-        if (!token) {
++        if (scheme !== "Bearer" || !token) {
+             return res.status(401).json({
+                 success: false,
+                 message: "Invalid authorization format"
+             });
+         }
+ 
+-        const decoded = jwt.verify(
+-            token,
+-            process.env.JWT_SECRET
+-        );
+-        console.log("Authenticated user:", decoded);
+-
+-        req.user = decoded;
++        // Pin the algorithm so a forged token cannot choose a weaker one.
++        // The decoded token holds personal data, so it is never logged.
++        req.user = jwt.verify(token, process.env.JWT_SECRET, {
++            algorithms: ["HS256"]
++        });
+ 
+         next();
+-
+-    } catch (error) {
+-        console.log(error);
+-
++    } catch {
+         return res.status(401).json({
+             success: false,
+             message: "Invalid or expired token"
+@@ -40,4 +35,4 @@ const authMiddleware = (req, res, next) => {
+     }
+ };
+ 
+-export default authMiddleware;
+\ No newline at end of file
++export default authMiddleware;
+diff --git a/backend/middleware/loginRateLimiter.js b/backend/middleware/loginRateLimiter.js
+index 2e87273..bea8fd3 100644
+--- a/backend/middleware/loginRateLimiter.js
++++ b/backend/middleware/loginRateLimiter.js
+@@ -2,7 +2,7 @@ import rateLimit from "express-rate-limit";
+ 
+ const loginRateLimiter = rateLimit({
+     windowMs: 15 * 60 * 1000,
+-    max: 5,
++    max: Number(process.env.LOGIN_RATE_LIMIT_MAX) || 5,
+     standardHeaders: true,
+     legacyHeaders: false,
+     message: {
+diff --git a/backend/package-lock.json b/backend/package-lock.json
+index 167932c..0abbf83 100644
+--- a/backend/package-lock.json
++++ b/backend/package-lock.json
+@@ -16,6 +16,7 @@
+         "dotenv": "^18.0.6",
+         "express": "^5.2.1",
+         "express-rate-limit": "^8.7.1",
++        "helmet": "^8.3.0",
+         "jsonwebtoken": "^9.0.3",
+         "multer": "^2.4.0",
+         "prisma": "^8.0.0-rc.20",
+@@ -4783,6 +4784,18 @@
+         "node": ">= 0.4"
+       }
+     },
++    "node_modules/helmet": {
++      "version": "8.3.0",
++      "resolved": "https://registry.npmjs.org/helmet/-/helmet-8.3.0.tgz",
++      "integrity": "sha512-Qgpiaws3Sm30Av8Eah6sjMCZZwjlBu+E68rhpCWBshY1lb09HtLwj5GviX0OyQIn+ulUS0iX0AxN5n3tLZzz1w==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=18.0.0"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/EvanHahn"
++      }
++    },
+     "node_modules/hono": {
+       "version": "4.11.4",
+       "resolved": "https://registry.npmjs.org/hono/-/hono-4.11.4.tgz",
+diff --git a/backend/package.json b/backend/package.json
+index 02c9981..79f650f 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -7,7 +7,8 @@
+   "scripts": {
+     "start": "node server.js",
+     "dev": "nodemon server.js",
+-    "postinstall": "prisma skills sync || exit 0"
++    "postinstall": "prisma skills sync || exit 0",
++    "test": "node --test tests/*.test.mjs"
+   },
+   "keywords": [],
+   "author": "",
+@@ -19,6 +20,7 @@
+     "dotenv": "^18.0.6",
+     "express": "^5.2.1",
+     "express-rate-limit": "^8.7.1",
++    "helmet": "^8.3.0",
+     "jsonwebtoken": "^9.0.3",
+     "multer": "^2.4.0",
+     "prisma": "^8.0.0-rc.20",
+diff --git a/backend/prisma/contract.d.ts b/backend/prisma/contract.d.ts
+index 72a4f56..5f0b8f4 100644
+--- a/backend/prisma/contract.d.ts
++++ b/backend/prisma/contract.d.ts
+@@ -34,7 +34,7 @@ import type {
+ } from '@prisma/orm-postgres/contract/types';
+ 
+ export type StorageHash =
+-  StorageHashBase<'3b86d5e00ec4545c9b8e6b2bc18409879364fc238d29ba6ad1f7fbb9b14842d3'>;
++  StorageHashBase<'b8d9d9b9aa5febf70d6988232a50637e80eea5847e2fe99a4a19c96b6bb13dbe'>;
+ export type ExecutionHash = ExecutionHashBase<string>;
+ export type ProfileHash =
+   ProfileHashBase<'3916f444a8a17ad749191acf9e08dad97d1a327b88c2f1d45d12f240296aa8b2'>;
+@@ -297,6 +297,14 @@ export type FieldOutputTypes = {
+       readonly storagePath: CodecTypes['pg/text@1']['output'];
+       readonly uploadedBy: CodecTypes['pg/int4@1']['output'];
+     };
++    readonly Intake: {
++      readonly answers: CodecTypes['pg/text@1']['output'];
++      readonly caseId: CodecTypes['pg/int4@1']['output'];
++      readonly createdAt: CodecTypes['pg/timestamptz-temporal@1']['output'];
++      readonly id: CodecTypes['pg/int4@1']['output'];
++      readonly safetyFlag: CodecTypes['pg/bool@1']['output'];
++      readonly userId: CodecTypes['pg/int4@1']['output'];
++    };
+     readonly Order: {
+       readonly amount: CodecTypes['pg/numeric@1']['output'] | null;
+       readonly createdAt: CodecTypes['pg/timestamptz-temporal@1']['output'];
+@@ -393,6 +401,14 @@ export type FieldInputTypes = {
+       readonly storagePath: CodecTypes['pg/text@1']['input'];
+       readonly uploadedBy: CodecTypes['pg/int4@1']['input'];
+     };
++    readonly Intake: {
++      readonly answers: CodecTypes['pg/text@1']['input'];
++      readonly caseId: CodecTypes['pg/int4@1']['input'];
++      readonly createdAt: CodecTypes['pg/timestamptz-temporal@1']['input'];
++      readonly id: CodecTypes['pg/int4@1']['input'];
++      readonly safetyFlag: CodecTypes['pg/bool@1']['input'];
++      readonly userId: CodecTypes['pg/int4@1']['input'];
++    };
+     readonly Order: {
+       readonly amount: CodecTypes['pg/numeric@1']['input'] | null;
+       readonly createdAt: CodecTypes['pg/timestamptz-temporal@1']['input'];
+@@ -489,6 +505,14 @@ export type StorageColumnTypes = {
+       readonly storagePath: CodecTypes['pg/text@1']['output'];
+       readonly uploadedBy: CodecTypes['pg/int4@1']['output'];
+     };
++    readonly Intake: {
++      readonly answers: CodecTypes['pg/text@1']['output'];
++      readonly caseId: CodecTypes['pg/int4@1']['output'];
++      readonly createdAt: CodecTypes['pg/timestamptz-temporal@1']['output'];
++      readonly id: CodecTypes['pg/int4@1']['output'];
++      readonly safetyFlag: CodecTypes['pg/bool@1']['output'];
++      readonly userId: CodecTypes['pg/int4@1']['output'];
++    };
+     readonly Order: {
+       readonly amount: CodecTypes['pg/numeric@1']['output'] | null;
+       readonly createdAt: CodecTypes['pg/timestamptz-temporal@1']['output'];
+@@ -585,6 +609,14 @@ export type StorageColumnInputTypes = {
+       readonly storagePath: CodecTypes['pg/text@1']['input'];
+       readonly uploadedBy: CodecTypes['pg/int4@1']['input'];
+     };
++    readonly Intake: {
++      readonly answers: CodecTypes['pg/text@1']['input'];
++      readonly caseId: CodecTypes['pg/int4@1']['input'];
++      readonly createdAt: CodecTypes['pg/timestamptz-temporal@1']['input'];
++      readonly id: CodecTypes['pg/int4@1']['input'];
++      readonly safetyFlag: CodecTypes['pg/bool@1']['input'];
++      readonly userId: CodecTypes['pg/int4@1']['input'];
++    };
+     readonly Order: {
+       readonly amount: CodecTypes['pg/numeric@1']['input'] | null;
+       readonly createdAt: CodecTypes['pg/timestamptz-temporal@1']['input'];
+@@ -686,6 +718,15 @@ export namespace Models {
+     uploadedBy: CodecTypes['pg/int4@1']['output'];
+     readonly [RelationKeys]?: never;
+   };
++  export type public_Intake = {
++    answers: CodecTypes['pg/text@1']['output'];
++    caseId: CodecTypes['pg/int4@1']['output'];
++    createdAt: CodecTypes['pg/timestamptz-temporal@1']['output'];
++    id: CodecTypes['pg/int4@1']['output'];
++    safetyFlag: CodecTypes['pg/bool@1']['output'];
++    userId: CodecTypes['pg/int4@1']['output'];
++    readonly [RelationKeys]?: never;
++  };
+   export type public_Order = {
+     amount: CodecTypes['pg/numeric@1']['output'] | null;
+     createdAt: CodecTypes['pg/timestamptz-temporal@1']['output'];
+@@ -744,6 +785,7 @@ export declare const models: {
+     Case: Models.public_Case;
+     Dependent: Models.public_Dependent;
+     Document: Models.public_Document;
++    Intake: Models.public_Intake;
+     Order: Models.public_Order;
+     Party: Models.public_Party;
+     Payment: Models.public_Payment;
+@@ -1029,6 +1071,53 @@ type ContractBase = Omit<
+               indexes: readonly [];
+               foreignKeys: readonly [];
+             };
++            readonly Intake: {
++              columns: {
++                readonly answers: {
++                  readonly nativeType: 'text';
++                  readonly codecId: 'pg/text@1';
++                  readonly nullable: false;
++                };
++                readonly caseId: {
++                  readonly nativeType: 'int4';
++                  readonly codecId: 'pg/int4@1';
++                  readonly nullable: false;
++                };
++                readonly createdAt: {
++                  readonly nativeType: 'timestamptz';
++                  readonly codecId: 'pg/timestamptz-temporal@1';
++                  readonly nullable: false;
++                  readonly default: { readonly kind: 'function'; readonly expression: 'now()' };
++                };
++                readonly id: {
++                  readonly nativeType: 'int4';
++                  readonly codecId: 'pg/int4@1';
++                  readonly nullable: false;
++                  readonly default: {
++                    readonly kind: 'function';
++                    readonly expression: 'autoincrement()';
++                  };
++                };
++                readonly safetyFlag: {
++                  readonly nativeType: 'bool';
++                  readonly codecId: 'pg/bool@1';
++                  readonly nullable: false;
++                  readonly default: {
++                    readonly kind: 'literal';
++                    readonly value: DefaultLiteralValue<'pg/bool@1', false>;
++                  };
++                };
++                readonly userId: {
++                  readonly nativeType: 'int4';
++                  readonly codecId: 'pg/int4@1';
++                  readonly nullable: false;
++                };
++              };
++              primaryKey: { readonly columns: readonly ['id'] };
++              uniques: readonly [{ readonly columns: readonly ['caseId'] }];
++              indexes: readonly [];
++              foreignKeys: readonly [];
++            };
+             readonly Order: {
+               columns: {
+                 readonly amount: {
+@@ -1295,6 +1384,7 @@ type ContractBase = Omit<
+     readonly Case: { readonly namespace: 'public' & NamespaceId; readonly model: 'Case' };
+     readonly Dependent: { readonly namespace: 'public' & NamespaceId; readonly model: 'Dependent' };
+     readonly Document: { readonly namespace: 'public' & NamespaceId; readonly model: 'Document' };
++    readonly Intake: { readonly namespace: 'public' & NamespaceId; readonly model: 'Intake' };
+     readonly Order: { readonly namespace: 'public' & NamespaceId; readonly model: 'Order' };
+     readonly Party: { readonly namespace: 'public' & NamespaceId; readonly model: 'Party' };
+     readonly Payment: { readonly namespace: 'public' & NamespaceId; readonly model: 'Payment' };
+@@ -1568,6 +1658,50 @@ type ContractBase = Omit<
+               };
+             };
+           };
++          readonly Intake: {
++            readonly fields: {
++              readonly answers: {
++                readonly nullable: false;
++                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/text@1' };
++              };
++              readonly caseId: {
++                readonly nullable: false;
++                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
++              };
++              readonly createdAt: {
++                readonly nullable: false;
++                readonly type: {
++                  readonly kind: 'scalar';
++                  readonly codecId: 'pg/timestamptz-temporal@1';
++                };
++              };
++              readonly id: {
++                readonly nullable: false;
++                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
++              };
++              readonly safetyFlag: {
++                readonly nullable: false;
++                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/bool@1' };
++              };
++              readonly userId: {
++                readonly nullable: false;
++                readonly type: { readonly kind: 'scalar'; readonly codecId: 'pg/int4@1' };
++              };
++            };
++            readonly relations: Record<string, never>;
++            readonly storage: {
++              readonly table: 'Intake';
++              readonly namespaceId: 'public';
++              readonly fields: {
++                readonly answers: { readonly column: 'answers' };
++                readonly caseId: { readonly column: 'caseId' };
++                readonly createdAt: { readonly column: 'createdAt' };
++                readonly id: { readonly column: 'id' };
++                readonly safetyFlag: { readonly column: 'safetyFlag' };
++                readonly userId: { readonly column: 'userId' };
++              };
++            };
++          };
+           readonly Order: {
+             readonly fields: {
+               readonly amount: {
+diff --git a/backend/prisma/contract.json b/backend/prisma/contract.json
+index dbdb0f4..937d3dd 100644
+--- a/backend/prisma/contract.json
++++ b/backend/prisma/contract.json
+@@ -24,6 +24,10 @@
+       "model": "Document",
+       "namespace": "public"
+     },
++    "Intake": {
++      "model": "Intake",
++      "namespace": "public"
++    },
+     "Order": {
+       "model": "Order",
+       "namespace": "public"
+@@ -484,6 +488,77 @@
+               "table": "Document"
+             }
+           },
++          "Intake": {
++            "fields": {
++              "answers": {
++                "nullable": false,
++                "type": {
++                  "codecId": "pg/text@1",
++                  "kind": "scalar"
++                }
++              },
++              "caseId": {
++                "nullable": false,
++                "type": {
++                  "codecId": "pg/int4@1",
++                  "kind": "scalar"
++                }
++              },
++              "createdAt": {
++                "nullable": false,
++                "type": {
++                  "codecId": "pg/timestamptz-temporal@1",
++                  "kind": "scalar"
++                }
++              },
++              "id": {
++                "nullable": false,
++                "type": {
++                  "codecId": "pg/int4@1",
++                  "kind": "scalar"
++                }
++              },
++              "safetyFlag": {
++                "nullable": false,
++                "type": {
++                  "codecId": "pg/bool@1",
++                  "kind": "scalar"
++                }
++              },
++              "userId": {
++                "nullable": false,
++                "type": {
++                  "codecId": "pg/int4@1",
++                  "kind": "scalar"
++                }
++              }
++            },
++            "relations": {},
++            "storage": {
++              "fields": {
++                "answers": {
++                  "column": "answers"
++                },
++                "caseId": {
++                  "column": "caseId"
++                },
++                "createdAt": {
++                  "column": "createdAt"
++                },
++                "id": {
++                  "column": "id"
++                },
++                "safetyFlag": {
++                  "column": "safetyFlag"
++                },
++                "userId": {
++                  "column": "userId"
++                }
++              },
++              "namespaceId": "public",
++              "table": "Intake"
++            }
++          },
+           "Order": {
+             "fields": {
+               "amount": {
+@@ -1182,6 +1257,66 @@
+               },
+               "uniques": []
+             },
++            "Intake": {
++              "columns": {
++                "answers": {
++                  "codecId": "pg/text@1",
++                  "nativeType": "text",
++                  "nullable": false
++                },
++                "caseId": {
++                  "codecId": "pg/int4@1",
++                  "nativeType": "int4",
++                  "nullable": false
++                },
++                "createdAt": {
++                  "codecId": "pg/timestamptz-temporal@1",
++                  "default": {
++                    "expression": "now()",
++                    "kind": "function"
++                  },
++                  "nativeType": "timestamptz",
++                  "nullable": false
++                },
++                "id": {
++                  "codecId": "pg/int4@1",
++                  "default": {
++                    "expression": "autoincrement()",
++                    "kind": "function"
++                  },
++                  "nativeType": "int4",
++                  "nullable": false
++                },
++                "safetyFlag": {
++                  "codecId": "pg/bool@1",
++                  "default": {
++                    "kind": "literal",
++                    "value": false
++                  },
++                  "nativeType": "bool",
++                  "nullable": false
++                },
++                "userId": {
++                  "codecId": "pg/int4@1",
++                  "nativeType": "int4",
++                  "nullable": false
++                }
++              },
++              "foreignKeys": [],
++              "indexes": [],
++              "primaryKey": {
++                "columns": [
++                  "id"
++                ]
++              },
++              "uniques": [
++                {
++                  "columns": [
++                    "caseId"
++                  ]
++                }
++              ]
++            },
+             "Order": {
+               "columns": {
+                 "amount": {
+@@ -1476,7 +1611,7 @@
+         "kind": "postgres-schema"
+       }
+     },
+-    "storageHash": "3b86d5e00ec4545c9b8e6b2bc18409879364fc238d29ba6ad1f7fbb9b14842d3"
++    "storageHash": "b8d9d9b9aa5febf70d6988232a50637e80eea5847e2fe99a4a19c96b6bb13dbe"
+   },
+   "capabilities": {
+     "postgres": {
+diff --git a/backend/prisma/contract.prisma b/backend/prisma/contract.prisma
+index 45fa34b..b62c24f 100644
+--- a/backend/prisma/contract.prisma
++++ b/backend/prisma/contract.prisma
+@@ -100,3 +100,12 @@ model AuditLog {
+   metadata String?
+   createdAt DateTime @default(now())
+ }
++
++model Intake {
++  id         Int      @id @default(autoincrement())
++  caseId     Int      @unique
++  userId     Int
++  answers    String
++  safetyFlag Boolean  @default(false)
++  createdAt  DateTime @default(now())
++}
+diff --git a/backend/prisma/intake.sql b/backend/prisma/intake.sql
+new file mode 100644
+index 0000000..31b6177
+--- /dev/null
++++ b/backend/prisma/intake.sql
+@@ -0,0 +1,11 @@
++-- Adds the Intake table (apply once on an existing database).
++-- `prisma db update` would also drop the manual RLS policy on "Document",
++-- so apply this file with psql instead and keep rls.sql applied.
++CREATE TABLE IF NOT EXISTS "Intake" (
++    "id"         SERIAL PRIMARY KEY,
++    "caseId"     INTEGER NOT NULL UNIQUE,
++    "userId"     INTEGER NOT NULL,
++    "answers"    TEXT NOT NULL,
++    "safetyFlag" BOOLEAN NOT NULL DEFAULT false,
++    "createdAt"  TIMESTAMPTZ NOT NULL DEFAULT now()
++);
+diff --git a/backend/routes/caseRoutes.js b/backend/routes/caseRoutes.js
+index 3dc90c6..9dfd76f 100644
+--- a/backend/routes/caseRoutes.js
++++ b/backend/routes/caseRoutes.js
+@@ -6,14 +6,25 @@ import updateCase from "../controllers/updateCaseController.js";
+ import deleteCase from "../controllers/deleteCaseController.js";
+ 
+ import getCaseById from "../controllers/getCaseByIdController.js";
++import validateId from "../middleware/validateIdMiddleware.js";
++import { getIntake, saveIntake } from "../controllers/intakeController.js";
++import navigatorController from "../controllers/navigatorController.js";
++import checklistController from "../controllers/checklistController.js";
+ 
+ const router = express.Router();
+ 
+ router.post("/", authMiddleware, createCase);
+ router.get("/", authMiddleware, getCases);
+-router.get("/:id", authMiddleware, getCaseById);
+-router.put("/:id", authMiddleware, updateCase);
+-router.delete("/:id", authMiddleware, deleteCase);
++router.get("/:id", authMiddleware, validateId, getCaseById);
++router.put("/:id", authMiddleware, validateId, updateCase);
++router.delete("/:id", authMiddleware, validateId, deleteCase);
++
++// Guided intake, Legal-Route Navigator and Document Readiness checklist.
++// POST (not PUT) for saving so the Next.js same-origin adapter can forward it.
++router.get("/:id/intake", authMiddleware, validateId, getIntake);
++router.post("/:id/intake", authMiddleware, validateId, saveIntake);
++router.get("/:id/navigator", authMiddleware, validateId, navigatorController);
++router.get("/:id/checklist", authMiddleware, validateId, checklistController);
+ 
+ 
+ export default router;
+\ No newline at end of file
+diff --git a/backend/routes/documentRoutes.js b/backend/routes/documentRoutes.js
+index 76e1eef..0a7e838 100644
+--- a/backend/routes/documentRoutes.js
++++ b/backend/routes/documentRoutes.js
+@@ -6,6 +6,7 @@ import upload from "../middleware/uploadMiddleware.js";
+ import uploadDocument from "../controllers/uploadDocumentController.js";
+ import downloadDocument from "../controllers/downloadDocumentController.js";
+ import validateId from "../middleware/validateIdMiddleware.js";
++import listDocuments from "../controllers/listDocumentsController.js";
+ 
+ const router = express.Router();
+ 
+@@ -18,6 +19,13 @@ router.post(
+ );
+ 
+ 
++router.get(
++    "/case/:caseId",
++    authMiddleware,
++    authorizeRoles("OWNER"),
++    listDocuments
++);
++
+ router.get(
+     "/:id/download",
+     authMiddleware,
+diff --git a/backend/server.js b/backend/server.js
+index 07be33b..5464774 100644
+--- a/backend/server.js
++++ b/backend/server.js
+@@ -1,8 +1,8 @@
+ import express from "express";
++import helmet from "helmet";
+ import "dotenv/config";
+ import caseRoutes from "./routes/caseRoutes.js";
+ 
+-import db from "./config/db.js";
+ import authRoutes from "./routes/authRoutes.js";
+ import partyRoutes from "./routes/partyRoutes.js";
+ import dependentRoutes from "./routes/dependentRoutes.js";
+@@ -12,13 +12,23 @@ import paymentRoutes from "./routes/paymentRoutes.js";
+ import documentRoutes from "./routes/documentRoutes.js";
+ import calculatorRoutes from "./routes/calculatorRoutes.js";
+ 
+-
+ import authMiddleware from "./middleware/authMiddleware.js";
+ 
++for (const name of ["DATABASE_URL", "JWT_SECRET", "FILE_ENCRYPTION_KEY"]) {
++    if (!process.env[name]) {
++        console.error(`Missing required environment variable: ${name}`);
++        process.exit(1);
++    }
++}
++
+ const app = express();
+ 
+-const PORT = 5000;
+-app.use(express.json());
++const PORT = Number(process.env.PORT) || 5000;
++
++app.disable("x-powered-by");
++app.use(helmet());
++app.use(express.json({ limit: "100kb" }));
++
+ app.use("/api/auth", authRoutes);
+ app.use("/api/cases", caseRoutes);
+ app.use("/api/parties", partyRoutes);
+@@ -27,27 +37,42 @@ app.use("/api/proceedings", proceedingRoutes);
+ app.use("/api/payments", paymentRoutes);
+ app.use("/api/calculator", calculatorRoutes);
+ app.use("/api/documents", documentRoutes);
+-
+ app.use("/api/orders", orderRoutes);
+ 
+-
+ app.get("/api/health", (req, res) => {
+-  res.status(200).json({
+-    success: true,
+-    message: "Backend is runing",
+-  });
++    res.status(200).json({
++        success: true,
++        message: "Backend is running"
++    });
+ });
+ 
+ app.get("/api/protected", authMiddleware, (req, res) => {
+-  res.status(200).json({
+-    success: true,
+-    message: "Protected route accessed",
+-    user: req.user,
+-  });
++    res.status(200).json({
++        success: true,
++        message: "Protected route accessed",
++        user: { id: req.user.id, role: req.user.role }
++    });
+ });
+ 
++// Bad JSON, rejected uploads and unknown routes get clean 4xx answers.
++app.use((req, res) => {
++    res.status(404).json({ success: false, message: "Not found" });
++});
+ 
++app.use((err, req, res, next) => {
++    if (err?.type === "entity.parse.failed") {
++        return res.status(400).json({ success: false, message: "Invalid JSON" });
++    }
++    if (err?.type === "entity.too.large") {
++        return res.status(413).json({ success: false, message: "Request too large" });
++    }
++    if (err?.name === "MulterError" || /Only PDF/.test(err?.message || "")) {
++        return res.status(400).json({ success: false, message: err.message });
++    }
++    console.log("Unhandled error:", err?.message);
++    res.status(500).json({ success: false, message: "Something went wrong" });
++});
+ 
+ app.listen(PORT, () => {
+-  console.log(`Server is running ${PORT}`);
++    console.log(`Server is running ${PORT}`);
+ });
+diff --git a/backend/services/checklist.js b/backend/services/checklist.js
+new file mode 100644
+index 0000000..01eeef9
+--- /dev/null
++++ b/backend/services/checklist.js
+@@ -0,0 +1,60 @@
++// Document Readiness checklist, mapped from blueprint section 15.
++// Status comes only from documents the user has added; nothing is "verified"
++// automatically and nothing is forced: missing records are fine.
++export const DOCUMENT_TYPES = [
++    "Identity / relationship",
++    "Financial record",
++    "Assets and liabilities",
++    "Child expenses",
++    "Court order",
++    "Payment proof",
++    "Safety record",
++    "Other"
++];
++
++const has = (list, x) => (list || []).includes(x);
++
++export const buildChecklist = (a, documents) => {
++    const count = (type) => documents.filter((d) => d.documentType === type).length;
++    const safetyRelevant = ["immediate", "yes"].includes(a.safetyRisk) || has(a.pendingProceedings, "dv");
++    const caseOpen = ["matrimonial", "maintenance", "dv"].some((p) => has(a.pendingProceedings, p)) || a.supportStatus === "order_exists";
++
++    const defs = [
++        { key: "identity_marriage", label: "Identity and marriage", documentType: "Identity / relationship",
++          examples: ["Identity proof", "Marriage certificate or registration", "Divorce papers, if applicable"],
++          applies: true, priority: "start" },
++        { key: "income", label: "Income", documentType: "Financial record",
++          examples: ["Salary slips", "Bank statements", "Income tax documents, where available"],
++          applies: true, priority: "start" },
++        { key: "assets_liabilities", label: "Assets and liabilities", documentType: "Assets and liabilities",
++          examples: ["Property details", "Loan obligations", "Major recurring commitments"],
++          applies: true, priority: "optional" },
++        { key: "children", label: "Children's expenses", documentType: "Child expenses",
++          examples: ["School or tuition costs", "Medical costs", "Custody-related orders"],
++          applies: a.hasDependentChildren !== "no", priority: "relevant" },
++        { key: "court", label: "Court papers", documentType: "Court order",
++          examples: ["Petition", "Order or notice", "Case number (CNR) and hearing dates"],
++          applies: true, priority: caseOpen ? "start" : "optional" },
++        { key: "payments", label: "Payments received", documentType: "Payment proof",
++          examples: ["Bank entries", "Receipts", "Transfer history"],
++          applies: true, priority: ["receiving", "order_exists"].includes(a.supportStatus) ? "relevant" : "optional" },
++        { key: "safety", label: "Safety records (private)", documentType: "Safety record",
++          examples: ["Protection order or complaint", "Medical or shelter records, where relevant"],
++          applies: safetyRelevant, priority: "relevant", privateVault: true,
++          note: "Add these only if it is safe to do so. A lawyer or legal-aid centre can help you keep them safe." }
++    ];
++
++    const items = defs.filter((d) => d.applies).map((d) => {
++        const added = count(d.documentType);
++        return { ...d, added, status: added ? "added" : "to_add", verified: false };
++    });
++
++    return {
++        items,
++        summary: {
++            applicable: items.length,
++            added: items.filter((i) => i.added > 0).length
++        },
++        guidance: "Missing information is okay. Add only what you have and what is needed. Records you add are not verified by Alimony+; a lawyer should check them before any filing."
++    };
++};
+diff --git a/backend/services/intake.js b/backend/services/intake.js
+new file mode 100644
+index 0000000..47b479a
+--- /dev/null
++++ b/backend/services/intake.js
+@@ -0,0 +1,64 @@
++// Guided intake: allow-listed answers only (no free text except location),
++// so nothing user-supplied can carry markup or instructions.
++export const INTAKE_OPTIONS = {
++    relationshipStatus: ["married", "separated", "divorced", "other", "unknown"],
++    marriageType: ["hindu_rites", "special_marriage_act", "muslim_nikah", "other", "unknown"],
++    hasDependentChildren: ["yes", "no", "unknown"],
++    ownIncome: ["none", "some", "unknown"],
++    respondentMeans: ["known", "partly", "unknown"],
++    supportStatus: ["receiving", "order_exists", "none", "unknown"],
++    safetyRisk: ["immediate", "yes", "no", "unknown"]
++};
++
++export const PENDING_OPTIONS = ["matrimonial", "dv", "maintenance", "none", "unknown"];
++const LOCATION_PATTERN = /^[\p{L}\p{N} .,'-]{0,80}$/u;
++
++export const defaultIntake = () => ({
++    ...Object.fromEntries(Object.keys(INTAKE_OPTIONS).map((k) => [k, "unknown"])),
++    pendingProceedings: ["unknown"],
++    location: ""
++});
++
++// Missing answers become "unknown" so "I do not know" never breaks the flow.
++export const validateIntake = (body) => {
++    if (!body || typeof body !== "object" || Array.isArray(body)) {
++        return { errors: ["Request body must be an object"] };
++    }
++    const value = defaultIntake();
++    const errors = [];
++
++    for (const [field, options] of Object.entries(INTAKE_OPTIONS)) {
++        if (body[field] === undefined) continue;
++        if (typeof body[field] !== "string" || !options.includes(body[field])) {
++            errors.push(`${field} must be one of: ${options.join(", ")}`);
++        } else {
++            value[field] = body[field];
++        }
++    }
++
++    if (body.pendingProceedings !== undefined) {
++        const list = body.pendingProceedings;
++        if (!Array.isArray(list) || list.length > PENDING_OPTIONS.length ||
++            list.some((x) => typeof x !== "string" || !PENDING_OPTIONS.includes(x))) {
++            errors.push(`pendingProceedings must be a list of: ${PENDING_OPTIONS.join(", ")}`);
++        } else {
++            const unique = [...new Set(list)];
++            value.pendingProceedings = unique.length ? unique : ["unknown"];
++        }
++    }
++
++    if (body.location !== undefined) {
++        const loc = typeof body.location === "string" ? body.location.trim() : null;
++        if (loc === null || !LOCATION_PATTERN.test(loc)) {
++            errors.push("location may contain letters, numbers, spaces and . , ' - (max 80 characters)");
++        } else {
++            value.location = loc;
++        }
++    }
++
++    return errors.length ? { errors } : { value };
++};
++
++export const isSafetyRisk = (answers) =>
++    ["immediate", "yes"].includes(answers.safetyRisk) ||
++    (answers.pendingProceedings || []).includes("dv");
+diff --git a/backend/services/legalRoutes.js b/backend/services/legalRoutes.js
+new file mode 100644
+index 0000000..fac417b
+--- /dev/null
++++ b/backend/services/legalRoutes.js
+@@ -0,0 +1,150 @@
++// Legal-Route Navigator rules, mapped from the Tech Tomorrow blueprint
++// (sections 04, 05, 08 and 12). Every route carries source, effective date
++// and review date. Nothing here decides entitlement or an amount.
++const REVIEWED_ON = "2026-10-06";
++const REVIEW_STATUS = "pending-legal-review";
++const src = (title, url, effectiveFrom = null) => ({
++    title, url, effectiveFrom, reviewedOn: REVIEWED_ON, reviewStatus: REVIEW_STATUS
++});
++
++export const ROUTES = {
++    bnss_144: {
++        id: "bnss_144",
++        title: "Maintenance order under BNSS s.144",
++        explainer: "A court route for maintenance of wives, children and parents where the statutory conditions are met. It can also include interim maintenance while the case is pending.",
++        questionsForCounsel: [
++            "Do the statutory conditions apply to my facts?",
++            "Which court should I file in, and what documents are needed?",
++            "Can I ask for interim maintenance while the case is pending?"
++        ],
++        source: src("BNSS 2023, s.144", "https://indiacode.ecourtsindia.com/bnss/section/144/", "2024-07-01")
++    },
++    hma_24: {
++        id: "hma_24",
++        title: "Interim maintenance under Hindu Marriage Act s.24",
++        explainer: "While a Hindu Marriage Act case is going on, either spouse who lacks enough independent income can ask for interim maintenance and case expenses. The law says such applications should, as far as possible, be decided within 60 days of notice being served.",
++        questionsForCounsel: [
++            "Can I apply now, and what income and expense details will the court expect?",
++            "How is the 60-day target tracked in my court?"
++        ],
++        source: src("Hindu Marriage Act 1955, s.24", "https://indiacode.ecourtsindia.com/hindu-marriage-act/section/24/")
++    },
++    hma_25: {
++        id: "hma_25",
++        title: "Permanent alimony under Hindu Marriage Act s.25",
++        explainer: "A longer-term maintenance order that can be made at the time of a decree or later, on application, after the court considers the circumstances the law lists.",
++        questionsForCounsel: [
++            "Is a post-decree application possible in my situation?",
++            "Which documents should I prepare first?"
++        ],
++        source: src("Hindu Marriage Act 1955, s.25", "https://indiacode.ecourtsindia.com/hindu-marriage-act/section/25/")
++    },
++    hama_18: {
++        id: "hama_18",
++        title: "Maintenance of a Hindu wife under HAMA s.18",
++        explainer: "A separate route for a Hindu wife during the marriage, subject to the section's conditions. It is available without a matrimonial case pending, and it is different from HMA s.24 and s.25.",
++        questionsForCounsel: [
++            "Do the conditions in s.18 apply to me?",
++            "Is this route better than, or in addition to, BNSS s.144 for my situation?"
++        ],
++        source: src("Hindu Adoptions and Maintenance Act 1956, s.18", "https://indiacode.ecourtsindia.com/hindu-adoptions-maintenance-act-1956/section/18/")
++    },
++    sma_36_37: {
++        id: "sma_36_37",
++        title: "Alimony under the Special Marriage Act ss.36-37",
++        explainer: "The Special Marriage Act has separate provisions for alimony while a case is pending (s.36) and for permanent alimony (s.37) in the proceedings where they apply.",
++        questionsForCounsel: [
++            "Which of s.36 or s.37 fits the stage of my case?",
++            "What do I need to show the court?"
++        ],
++        source: src("Special Marriage Act 1954, ss.36-37", "https://indiacode.ecourtsindia.com/special-marriage-act-1954/section/36/")
++    },
++    muslim_divorced: {
++        id: "muslim_divorced",
++        title: "Divorced Muslim women: maintenance remedies",
++        explainer: "In July 2024 the Supreme Court held that the old CrPC s.125 maintenance route is available to divorced Muslim women, in addition to remedies under the 1986 Act. Because BNSS is now in force, the current equivalent provision and any personal-law questions need a lawyer to confirm.",
++        questionsForCounsel: [
++            "Which provision now corresponds to the old CrPC s.125 route?",
++            "Which of the available remedies suits my situation?"
++        ],
++        source: src("Mohd Abdul Samad v. State of Telangana", "https://indiankanoon.org/doc/7964121/", "2024-07-10")
++    },
++    dv_s20: {
++        id: "dv_s20",
++        title: "Monetary relief under the Domestic Violence Act s.20",
++        explainer: "In domestic-violence proceedings the court can order monetary reliefs, which can include maintenance, alongside protection, residence and custody orders.",
++        questionsForCounsel: [
++            "Which protection and monetary reliefs can I ask for together?",
++            "How do I keep my records and evidence safe?"
++        ],
++        source: src("Protection of Women from Domestic Violence Act 2005, s.20", "https://www.indiacode.nic.in/handle/123456789/2021")
++    }
++};
++
++export const LEGAL_AID = {
++    title: "Free legal aid (NALSA / DLSA / SLSA)",
++    helpline: "15100",
++    explainer: "Women can seek free legal assistance through the Taluk Legal Services Committee, the District Legal Services Authority, the State Legal Services Authority, Legal Aid Clinics, an online application, or the NALSA helpline.",
++    source: src("NALSA: Assistance for Women", "https://nalsa.gov.in/womens-assistance/")
++};
++
++export const SAFETY = {
++    title: "Your safety comes first",
++    message: "Because you mentioned a safety risk, the normal case steps are paused. Please reach out to emergency or legal-aid help first. You can return to your case at any time.",
++    contacts: [
++        { label: "Emergency services (India)", value: "112" },
++        { label: "NALSA legal-aid helpline", value: "15100" }
++    ],
++    note: "Emergency contacts must be verified for the user's jurisdiction before public launch."
++};
++
++export const DISCLAIMER =
++    "These are possible legal routes based on the answers you gave. This is general information, not legal advice, and it does not decide what you are entitled to. A lawyer or legal-aid professional can confirm which route fits your case.";
++
++const has = (list, x) => (list || []).includes(x);
++
++export const buildNavigator = (a) => {
++    const routes = [];
++    const add = (id, reason) => {
++        const found = routes.find((r) => r.id === id);
++        if (found) { found.reasons.push(reason); return; }
++        routes.push({ ...ROUTES[id], confidence: "possible", reasons: [reason] });
++    };
++
++    const matrimonial = has(a.pendingProceedings, "matrimonial");
++    const hindu = a.marriageType === "hindu_rites";
++    const married = ["married", "separated"].includes(a.relationshipStatus);
++    const divorced = a.relationshipStatus === "divorced";
++
++    if (a.relationshipStatus !== "other") {
++        add("bnss_144", "Available as a general maintenance route for wives, children and parents where the conditions are met.");
++    }
++    if (hindu && matrimonial) add("hma_24", "You married under Hindu rites and a matrimonial case is pending.");
++    if (hindu && (divorced || matrimonial)) add("hma_25", divorced ? "You married under Hindu rites and are divorced." : "You married under Hindu rites and a matrimonial case is pending.");
++    if (hindu && married && !matrimonial) add("hama_18", "You married under Hindu rites, the marriage continues, and no matrimonial case is pending.");
++    if (a.marriageType === "special_marriage_act" && (matrimonial || divorced)) add("sma_36_37", "You married under the Special Marriage Act and are in or after a matrimonial case.");
++    if (a.marriageType === "muslim_nikah" && divorced) add("muslim_divorced", "You are a divorced Muslim woman; more than one remedy may be open to you.");
++    if (isSafety(a)) add("dv_s20", "You mentioned domestic violence or a safety risk.");
++
++    const pendingCount = (a.pendingProceedings || []).filter((x) => ["matrimonial", "dv", "maintenance"].includes(x)).length;
++    const overlap = pendingCount >= 2 || (a.supportStatus === "order_exists" && has(a.pendingProceedings, "maintenance"));
++
++    return {
++        safetyFirst: isSafety(a),
++        safety: isSafety(a) ? SAFETY : null,
++        routes,
++        needsMoreInfo: ["marriageType", "relationshipStatus"].filter((f) => ["unknown", "other"].includes(a[f])),
++        overlapWarning: overlap
++            ? "More than one maintenance-related case or order may exist. Overlapping proceedings can matter. Please share the details with a lawyer or legal-aid professional."
++            : null,
++        existingOrderNote: a.supportStatus === "order_exists"
++            ? "You said an order already exists. Keep the order and payment records together; the case tracker can help you log payments."
++            : null,
++        legalAid: LEGAL_AID,
++        disclaimer: DISCLAIMER
++    };
++};
++
++function isSafety(a) {
++    return ["immediate", "yes"].includes(a.safetyRisk) || has(a.pendingProceedings, "dv");
++}
+diff --git a/backend/tests/api.test.mjs b/backend/tests/api.test.mjs
+new file mode 100644
+index 0000000..fd2e519
+--- /dev/null
++++ b/backend/tests/api.test.mjs
+@@ -0,0 +1,218 @@
++// Integration + security tests. They run against a live backend and database:
++//   BASE_URL=http://127.0.0.1:5000 node --test tests/
++import test from "node:test";
++import assert from "node:assert/strict";
++
++const BASE = process.env.BASE_URL || "http://127.0.0.1:5000";
++const run = Date.now();
++const call = async (path, { method = "GET", token, body, form } = {}) => {
++    const headers = {};
++    if (token) headers.Authorization = `Bearer ${token}`;
++    if (body) headers["Content-Type"] = "application/json";
++    const res = await fetch(`${BASE}/api${path}`, {
++        method, headers, body: form ?? (body ? JSON.stringify(body) : undefined)
++    });
++    const type = res.headers.get("content-type") || "";
++    return { res, status: res.status, json: type.includes("json") ? await res.json() : null };
++};
++
++const signup = async (tag) => {
++    const email = `${tag}-${run}@test.example`;
++    const password = "Passw0rd!test";
++    await call("/auth/register", { method: "POST", body: { name: tag, email, password } });
++    const { json } = await call("/auth/login", { method: "POST", body: { email, password } });
++    return json.token;
++};
++
++const png = () => Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
++const upload = (token, caseId, { type = "image/png", bytes = png(), docType = "Identity / relationship" } = {}) => {
++    const form = new FormData();
++    form.append("caseId", String(caseId));
++    form.append("documentType", docType);
++    form.append("document", new Blob([bytes], { type }), "proof.png");
++    return call("/documents/upload", { method: "POST", token, form });
++};
++
++let alice, mallory, caseId, docId;
++
++test("setup: two separate users and one case owned by Alice", async () => {
++    alice = await signup("alice");
++    mallory = await signup("mallory");
++    const created = await call("/cases", { method: "POST", token: alice, body: { title: "Alice case" } });
++    assert.equal(created.status, 201);
++    caseId = created.json.case.id;
++});
++
++test("unauthenticated requests are rejected", async () => {
++    for (const path of [`/cases/${caseId}`, `/cases/${caseId}/intake`, `/cases/${caseId}/navigator`,
++        `/cases/${caseId}/checklist`, `/documents/case/${caseId}`]) {
++        assert.equal((await call(path)).status, 401, path);
++    }
++});
++
++test("intake: invalid values are rejected, 'I do not know' is accepted", async () => {
++    const bad = await call(`/cases/${caseId}/intake`, { method: "POST", token: alice, body: { marriageType: "<script>alert(1)</script>" } });
++    assert.equal(bad.status, 400);
++    const badList = await call(`/cases/${caseId}/intake`, { method: "POST", token: alice, body: { pendingProceedings: ["matrimonial", "x"] } });
++    assert.equal(badList.status, 400);
++    const badLoc = await call(`/cases/${caseId}/intake`, { method: "POST", token: alice, body: { location: "<img src=x onerror=alert(1)>" } });
++    assert.equal(badLoc.status, 400);
++    const partial = await call(`/cases/${caseId}/intake`, { method: "POST", token: alice, body: { relationshipStatus: "married" } });
++    assert.equal(partial.status, 200);
++    assert.equal(partial.json.intake.answers.marriageType, "unknown");
++});
++
++test("navigator: Hindu marriage, married, no case pending -> HAMA s.18 and BNSS s.144", async () => {
++    await call(`/cases/${caseId}/intake`, { method: "POST", token: alice,
++        body: { relationshipStatus: "married", marriageType: "hindu_rites", pendingProceedings: ["none"], location: "Delhi" } });
++    const { status, json } = await call(`/cases/${caseId}/navigator`, { token: alice });
++    assert.equal(status, 200);
++    const ids = json.navigator.routes.map((r) => r.id);
++    assert.deepEqual(ids.sort(), ["bnss_144", "hama_18"]);
++    assert.equal(json.navigator.safetyFirst, false);
++    for (const r of json.navigator.routes) {
++        assert.ok(r.source.url && r.source.reviewedOn, "every route cites a source and review date");
++        assert.equal(r.confidence, "possible");
++    }
++    assert.match(json.navigator.disclaimer, /not legal advice/);
++    // The disclaimer may say the tool does not decide entitlement; it must never state an entitlement amount.
++    assert.ok(!/you are entitled to\s*(INR|Rs|₹|\d)/i.test(JSON.stringify(json)));
++});
++
++test("navigator: matrimonial case pending -> HMA s.24 and s.25", async () => {
++    await call(`/cases/${caseId}/intake`, { method: "POST", token: alice,
++        body: { relationshipStatus: "separated", marriageType: "hindu_rites", pendingProceedings: ["matrimonial"] } });
++    const { json } = await call(`/cases/${caseId}/navigator`, { token: alice });
++    const ids = json.navigator.routes.map((r) => r.id);
++    assert.ok(ids.includes("hma_24") && ids.includes("hma_25") && !ids.includes("hama_18"));
++});
++
++test("safety: a disclosed risk switches to the safety-first response", async () => {
++    await call(`/cases/${caseId}/intake`, { method: "POST", token: alice, body: { safetyRisk: "immediate" } });
++    const { json } = await call(`/cases/${caseId}/navigator`, { token: alice });
++    assert.equal(json.navigator.safetyFirst, true);
++    assert.ok(json.navigator.safety.contacts.length >= 1);
++    assert.ok(json.navigator.routes.some((r) => r.id === "dv_s20"));
++    await call(`/cases/${caseId}/intake`, { method: "POST", token: alice, body: { safetyRisk: "no", pendingProceedings: ["none"] } });
++});
++
++test("overlap: two pending proceedings are flagged for legal review", async () => {
++    await call(`/cases/${caseId}/intake`, { method: "POST", token: alice, body: { pendingProceedings: ["matrimonial", "maintenance"] } });
++    const { json } = await call(`/cases/${caseId}/navigator`, { token: alice });
++    assert.ok(json.navigator.overlapWarning);
++});
++
++test("documents: upload works, spoofed content and unknown category are rejected", async () => {
++    const ok = await upload(alice, caseId);
++    assert.equal(ok.status, 201);
++    docId = ok.json.document.id;
++    const html = await upload(alice, caseId, { bytes: Buffer.from("<html><script>alert(1)</script></html>") });
++    assert.equal(html.status, 400);
++    const badType = await upload(alice, caseId, { docType: "<b>x</b>" });
++    assert.equal(badType.status, 400);
++});
++
++test("checklist reflects uploaded documents and never marks anything verified", async () => {
++    const { json } = await call(`/cases/${caseId}/checklist`, { token: alice });
++    const identity = json.checklist.items.find((i) => i.key === "identity_marriage");
++    assert.equal(identity.status, "added");
++    assert.ok(json.checklist.items.every((i) => i.verified === false));
++});
++
++test("IDOR: Mallory cannot read or change any of Alice's records", async () => {
++    const reads = [`/cases/${caseId}`, `/cases/${caseId}/intake`, `/cases/${caseId}/navigator`,
++        `/cases/${caseId}/checklist`, `/documents/case/${caseId}`, `/documents/${docId}/download`,
++        `/parties/case/${caseId}`];
++    for (const path of reads) {
++        const r = await call(path, { token: mallory });
++        assert.ok([403, 404].includes(r.status), `${path} returned ${r.status}`);
++    }
++    const writes = [
++        ["/cases/" + caseId + "/intake", "POST", { safetyRisk: "no" }],
++        ["/cases/" + caseId, "PUT", { title: "hijacked" }],
++        ["/cases/" + caseId, "DELETE"],
++        ["/calculator/run", "POST", { caseId, applicantIncome: 1 }],
++        ["/parties", "POST", { caseId, name: "x", role: "y" }]
++    ];
++    for (const [path, method, body] of writes) {
++        const r = await call(path, { method, token: mallory, body });
++        assert.ok([403, 404].includes(r.status), `${method} ${path} returned ${r.status}`);
++    }
++    assert.equal((await upload(mallory, caseId)).status, 403);
++    const mine = await call("/cases", { token: mallory });
++    assert.ok(!mine.json.cases.some((c) => c.id === caseId));
++    const still = await call(`/cases/${caseId}`, { token: alice });
++    assert.equal(still.json.case.title, "Alice case");
++});
++
++test("IDOR: id parameters are validated", async () => {
++    for (const id of ["abc", "-1", "0", "1.5", "1;DROP"]) {
++        assert.equal((await call(`/cases/${id}`, { token: alice })).status, 400, id);
++    }
++});
++
++test("XSS: markup in titles is returned as inert JSON with safe headers", async () => {
++    const payload = "<script>alert(1)</script>";
++    const created = await call("/cases", { method: "POST", token: alice, body: { title: payload } });
++    assert.equal(created.status, 201);
++    const got = await call(`/cases/${created.json.case.id}`, { token: alice });
++    assert.match(got.res.headers.get("content-type"), /application\/json/);
++    assert.equal(got.res.headers.get("x-content-type-options"), "nosniff");
++    assert.equal(got.json.case.title, payload);
++});
++
++test("privacy: no password hashes or tokens leak in responses", async () => {
++    for (const path of ["/cases", `/cases/${caseId}/intake`, "/protected"]) {
++        const r = await call(path, { token: alice });
++        const text = JSON.stringify(r.json);
++        assert.ok(!/\$2[aby]\$/.test(text) && !/"password"/.test(text), path);
++    }
++});
++
++test("hardening: malformed JSON and unknown routes get clean errors", async () => {
++    const res = await fetch(`${BASE}/api/cases`, { method: "POST",
++        headers: { "Content-Type": "application/json", Authorization: `Bearer ${alice}` }, body: "{bad" });
++    assert.equal(res.status, 400);
++    assert.equal((await call("/does-not-exist")).status, 404);
++    assert.equal((await fetch(`${BASE}/api/health`)).headers.get("x-powered-by"), null);
++});
++
++test("download: filename header cannot be injected", async () => {
++    const r = await fetch(`${BASE}/api/documents/${docId}/download`, { headers: { Authorization: `Bearer ${alice}` } });
++    assert.equal(r.status, 200);
++    assert.equal(r.headers.get("x-content-type-options"), "nosniff");
++    assert.match(r.headers.get("content-disposition"), /^attachment;/);
++});
++
++test("IDOR: Mallory cannot read or create under Alice's dependents, proceedings, orders and payments", async () => {
++    const dep = await call("/dependents", { method: "POST", token: alice, body: { caseId, name: "Child A" } });
++    const pro = await call("/proceedings", { method: "POST", token: alice, body: { caseId, courtName: "Family Court", proceedingType: "HMA 24" } });
++    assert.equal(dep.status, 201, "alice dependent");
++    assert.equal(pro.status, 201, "alice proceeding");
++    const proId = pro.json.proceeding.id;
++    const ord = await call("/orders", { method: "POST", token: alice, body: { proceedingId: proId, orderType: "Interim", amount: 1000 } });
++    assert.equal(ord.status, 201, "alice order");
++    const ordId = ord.json.order.id;
++    const pay = await call("/payments", { method: "POST", token: alice, body: { orderId: ordId, amount: 500, paymentDate: "2026-10-01" } });
++    assert.equal(pay.status, 201, "alice payment");
++    const payId = pay.json.payment.id;
++
++    const reads = [`/dependents/case/${caseId}`, `/proceedings/case/${caseId}`, `/proceedings/${proId}`,
++        `/orders/proceeding/${proId}`, `/orders/${ordId}`, `/payments/order/${ordId}`, `/payments/${payId}`];
++    for (const path of reads) {
++        const own = await call(path, { token: alice });
++        assert.equal(own.status, 200, `alice ${path} returned ${own.status}`);
++        const r = await call(path, { token: mallory });
++        assert.ok([403, 404].includes(r.status), `${path} returned ${r.status} for mallory`);
++    }
++    const writes = [
++        ["/dependents", { caseId, name: "x" }],
++        ["/proceedings", { caseId, courtName: "x" }],
++        ["/orders", { proceedingId: proId, orderType: "x" }],
++        ["/payments", { orderId: ordId, amount: 1, paymentDate: "2026-10-01" }]
++    ];
++    for (const [path, body] of writes) {
++        const r = await call(path, { method: "POST", token: mallory, body });
++        assert.ok([403, 404].includes(r.status), `POST ${path} returned ${r.status} for mallory`);
++    }
++});
+diff --git a/backend/utils/encryption.js b/backend/utils/encryption.js
+index d08fb98..591cfff 100644
+--- a/backend/utils/encryption.js
++++ b/backend/utils/encryption.js
+@@ -5,14 +5,17 @@ const ALGORITHM = "aes-256-gcm";
+ const getEncryptionKey = () => {
+     const key = process.env.FILE_ENCRYPTION_KEY;
+ 
+-    console.log("Key length:", key?.length);
+-    console.log("Key bytes:", key ? Buffer.from(key, "hex").length : 0);
+-
+     if (!key) {
+         throw new Error("FILE_ENCRYPTION_KEY is not configured");
+     }
+ 
+-    return Buffer.from(key, "hex");
++    const bytes = Buffer.from(key, "hex");
++
++    if (bytes.length !== 32) {
++        throw new Error("FILE_ENCRYPTION_KEY must be 32 bytes (64 hex characters)");
++    }
++
++    return bytes;
+ };
+ 
+ export const encryptFile = (buffer) => {
+diff --git a/backend/utils/fileSignature.js b/backend/utils/fileSignature.js
+new file mode 100644
+index 0000000..521b127
+--- /dev/null
++++ b/backend/utils/fileSignature.js
+@@ -0,0 +1,23 @@
++// Check a file's leading bytes against the MIME type the client declared.
++export const ALLOWED_MIME = [
++    "application/pdf",
++    "image/jpeg",
++    "image/png",
++    "application/msword",
++    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
++];
++
++const startsWith = (buf, bytes) => bytes.every((b, i) => buf[i] === b);
++
++export const matchesDeclaredType = (buffer, mime) => {
++    if (!buffer || buffer.length < 8) return false;
++    switch (mime) {
++        case "application/pdf": return startsWith(buffer, [0x25, 0x50, 0x44, 0x46, 0x2d]);
++        case "image/png": return startsWith(buffer, [0x89, 0x50, 0x4e, 0x47]);
++        case "image/jpeg": return startsWith(buffer, [0xff, 0xd8, 0xff]);
++        case "application/msword": return startsWith(buffer, [0xd0, 0xcf, 0x11, 0xe0]);
++        case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
++            return startsWith(buffer, [0x50, 0x4b, 0x03, 0x04]);
++        default: return false;
++    }
++};
+diff --git a/backend/utils/ownedCase.js b/backend/utils/ownedCase.js
+new file mode 100644
+index 0000000..4c96c9a
+--- /dev/null
++++ b/backend/utils/ownedCase.js
+@@ -0,0 +1,18 @@
++import db from "../config/db.js";
++
++// Resolve a case and verify that it belongs to the signed-in user.
++// Returns { error: { status, message } } or { caseData }.
++export const getOwnedCase = async (rawId, userId) => {
++    const id = Number(rawId);
++    if (!Number.isInteger(id) || id <= 0) {
++        return { error: { status: 400, message: "Invalid Case ID" } };
++    }
++    const caseData = await db.orm.public.Case.where((c) => c.id.eq(id)).first();
++    if (!caseData) {
++        return { error: { status: 404, message: "Case not found" } };
++    }
++    if (caseData.userId !== userId) {
++        return { error: { status: 403, message: "Access denied" } };
++    }
++    return { caseData };
++};
+diff --git a/docs/INTEGRATION.md b/docs/INTEGRATION.md
+new file mode 100644
+index 0000000..2549f8e
+--- /dev/null
++++ b/docs/INTEGRATION.md
+@@ -0,0 +1,47 @@
++# Integration notes: intake, Legal-Route Navigator, Document Readiness
++
++## New backend endpoints (all require a signed-in user and ownership of the case)
++
++| Method | Path | Purpose |
++| --- | --- | --- |
++| GET / POST | `/api/cases/:id/intake` | Read / save the 9 guided-intake answers (allow-listed values only; missing answers become `unknown`) |
++| GET | `/api/cases/:id/navigator` | Possible legal routes from the saved intake, each with source, effective date, review date and review status; safety-first response when a risk is disclosed |
++| GET | `/api/cases/:id/checklist` | Document Readiness checklist built from the intake and the documents already added |
++| GET | `/api/documents/case/:caseId` | Safe document metadata for a case (no storage paths) |
++
++Rules live in `backend/services/` (`intake.js`, `legalRoutes.js`, `checklist.js`). Route sources use the blueprint's source register; every route is marked `pending-legal-review` until a qualified reviewer approves it.
++
++## Database
++
++Apply once on an existing database (do **not** use `prisma db update` here: it would drop the manual RLS policy on `Document`):
++
++```
++psql "$DATABASE_URL" -f backend/prisma/intake.sql
++psql "$DATABASE_URL" -f backend/prisma/rls.sql   # only if not applied yet
++```
++
++## Security changes
++
++- Server: `helmet`, no `x-powered-by`, 100 kb JSON limit, clean 400/404/413 errors, required env vars checked at start-up, `PORT` from env.
++- Auth: JWT algorithm pinned to HS256; decoded token and key length are no longer logged.
++- Uploads: file bytes must match the declared type; document category must be on the allow-list; case ownership is checked before anything is written to disk.
++- Downloads: safe `Content-Disposition`, `nosniff`, `no-store`, MIME re-checked against the allow-list.
++- All `/api/cases/:id` routes validate the id.
++- Fixed a start-up crash on case-sensitive file systems (`createPartyController.js` file name).
++- Removed nothing from the existing API contract.
++
++## Tests
++
++```
++cd backend && BASE_URL=http://127.0.0.1:5000 npm test     # 15 integration/security tests (needs running backend + DB; set LOGIN_RATE_LIMIT_MAX=1000 on the server for repeated runs)
++cd frontend && npm run typecheck && npm test && npm run build
++```
++
++The backend suite covers unauthenticated access, cross-user IDOR on reads and writes, id validation, stored-XSS payloads, spoofed uploads, safety-first routing, overlap flagging, privacy of responses and header hardening.
++
++## Known limits
++
++- Navigator rules cover the routes in the blueprint only; they have not had qualified legal review.
++- Emergency numbers (112, 15100) must be verified for the user's jurisdiction before public launch.
++- Intake, navigator and checklist need a signed-in workspace; demo mode shows a sign-in prompt.
++- The Playwright end-to-end specs were not run in this environment.
+diff --git a/frontend/src/app/[section]/page.tsx b/frontend/src/app/[section]/page.tsx
+index 1c59eb9..a6b0fc8 100644
+--- a/frontend/src/app/[section]/page.tsx
++++ b/frontend/src/app/[section]/page.tsx
+@@ -10,6 +10,8 @@ export default async function Page({
+   if (
+     ![
+       "dashboard",
++      "intake",
++      "navigator",
+       "cases",
+       "orders",
+       "payments",
+diff --git a/frontend/src/app/api/backend/[...path]/route.ts b/frontend/src/app/api/backend/[...path]/route.ts
+index d4ccd54..8576f55 100644
+--- a/frontend/src/app/api/backend/[...path]/route.ts
++++ b/frontend/src/app/api/backend/[...path]/route.ts
+@@ -4,6 +4,8 @@ import { cookies } from "next/headers";
+ const allowed: Record<string, RegExp[]> = {
+   GET: [
+     /^cases(?:\/\d+)?$/,
++    /^cases\/\d+\/(?:intake|navigator|checklist)$/,
++    /^documents\/case\/\d+$/,
+     /^proceedings\/(?:case\/)?\d+$/,
+     /^orders\/(?:proceeding\/)?\d+$/,
+     /^payments\/(?:order\/)?\d+$/,
+@@ -12,6 +14,7 @@ const allowed: Record<string, RegExp[]> = {
+   ],
+   POST: [
+     /^auth\/(login|register|logout)$/,
++    /^cases\/\d+\/intake$/,
+     /^(cases|proceedings|orders|payments)$/,
+     /^documents\/upload$/,
+     /^calculator\/run$/,
+diff --git a/frontend/src/app/globals.css b/frontend/src/app/globals.css
+index ab040f6..15184e8 100644
+--- a/frontend/src/app/globals.css
++++ b/frontend/src/app/globals.css
+@@ -2441,3 +2441,27 @@ td small {
+ .table-scroll {
+   position: relative;
+ }
++
++/* Guided intake: accessible radio / checkbox groups with large touch targets */
++fieldset.field {
++  border: 0;
++  padding: 0;
++  margin: 0 0 1.5rem;
++}
++fieldset.field legend {
++  font-weight: 600;
++  margin-bottom: 0.5rem;
++}
++.choice {
++  display: flex;
++  align-items: center;
++  gap: 0.75rem;
++  min-height: 44px;
++  padding: 0.25rem 0;
++  cursor: pointer;
++}
++.choice input {
++  width: 1.25rem;
++  height: 1.25rem;
++  flex: none;
++}
+diff --git a/frontend/src/components/journey-views.tsx b/frontend/src/components/journey-views.tsx
+new file mode 100644
+index 0000000..a08a846
+--- /dev/null
++++ b/frontend/src/components/journey-views.tsx
+@@ -0,0 +1,554 @@
++"use client";
++import { useCallback, useEffect, useState } from "react";
++import Link from "next/link";
++import { useRouter } from "next/navigation";
++import { Check, CircleAlert, FolderHeart, Phone, ShieldCheck } from "lucide-react";
++import { api } from "@/lib/api";
++import { Badge, Empty, ExternalLink, PageHeading } from "./ui";
++import { useWorkspace } from "./workspace-provider";
++
++type Intake = {
++  relationshipStatus: string;
++  marriageType: string;
++  pendingProceedings: string[];
++  hasDependentChildren: string;
++  ownIncome: string;
++  respondentMeans: string;
++  supportStatus: string;
++  safetyRisk: string;
++  location: string;
++};
++const blank: Intake = {
++  relationshipStatus: "unknown",
++  marriageType: "unknown",
++  pendingProceedings: ["unknown"],
++  hasDependentChildren: "unknown",
++  ownIncome: "unknown",
++  respondentMeans: "unknown",
++  supportStatus: "unknown",
++  safetyRisk: "unknown",
++  location: "",
++};
++const IDK = { value: "unknown", label: "I don’t know" };
++const questions: {
++  key: Exclude<keyof Intake, "pendingProceedings" | "location">;
++  label: string;
++  options: { value: string; label: string }[];
++}[] = [
++  {
++    key: "relationshipStatus",
++    label: "Are you currently married, separated or divorced?",
++    options: [
++      { value: "married", label: "Married" },
++      { value: "separated", label: "Separated" },
++      { value: "divorced", label: "Divorced" },
++      { value: "other", label: "Something else" },
++      IDK,
++    ],
++  },
++  {
++    key: "marriageType",
++    label: "How was the marriage solemnized or registered?",
++    options: [
++      { value: "hindu_rites", label: "Hindu rites" },
++      { value: "special_marriage_act", label: "Registered under the Special Marriage Act" },
++      { value: "muslim_nikah", label: "Muslim nikah" },
++      { value: "other", label: "Another way" },
++      IDK,
++    ],
++  },
++  {
++    key: "hasDependentChildren",
++    label: "Do you have dependent children?",
++    options: [{ value: "yes", label: "Yes" }, { value: "no", label: "No" }, IDK],
++  },
++  {
++    key: "ownIncome",
++    label: "Do you have your own income or assets?",
++    options: [
++      { value: "some", label: "Yes, some" },
++      { value: "none", label: "No" },
++      IDK,
++    ],
++  },
++  {
++    key: "respondentMeans",
++    label: "What do you know about your spouse’s income and assets?",
++    options: [
++      { value: "known", label: "I know most of it" },
++      { value: "partly", label: "I know some of it" },
++      IDK,
++    ],
++  },
++  {
++    key: "supportStatus",
++    label: "Are you receiving any support, or is there already a court order?",
++    options: [
++      { value: "receiving", label: "Receiving some support, no order" },
++      { value: "order_exists", label: "A court order already exists" },
++      { value: "none", label: "Neither" },
++      IDK,
++    ],
++  },
++  {
++    key: "safetyRisk",
++    label: "Is there domestic violence or an immediate safety risk?",
++    options: [
++      { value: "immediate", label: "Yes, I am in immediate danger" },
++      { value: "yes", label: "Yes, violence or threats, but not immediate" },
++      { value: "no", label: "No" },
++      { value: "unknown", label: "I’d rather not say" },
++    ],
++  },
++];
++const pendingOptions = [
++  { value: "matrimonial", label: "A divorce or other matrimonial case" },
++  { value: "dv", label: "A domestic-violence case" },
++  { value: "maintenance", label: "A maintenance case" },
++  { value: "none", label: "No case is pending" },
++  IDK,
++];
++const answerable = (a: Intake) =>
++  questions.filter((q) => a[q.key] !== "unknown").length +
++  (a.pendingProceedings.some((p) => p !== "unknown") ? 1 : 0) +
++  (a.location ? 1 : 0);
++
++function useJourneyCase() {
++  const { data, demo, selectedCase, setSelectedCase } = useWorkspace();
++  const caseId =
++    data.cases.find((c) => c.id === selectedCase)?.id || data.cases[0]?.id || 0;
++  return { data, demo, caseId, setSelectedCase };
++}
++function JourneyGate({
++  demo,
++  hasCase,
++  children,
++}: {
++  demo: boolean;
++  hasCase: boolean;
++  children: React.ReactNode;
++}) {
++  if (demo)
++    return (
++      <Empty
++        title="Sign in to use this step"
++        action={
++          <Link className="button primary" href="/login">
++            Connect your account
++          </Link>
++        }
++      >
++        Your answers are saved privately to your own case, so this step needs a
++        signed-in workspace. The demo workspace does not store them.
++      </Empty>
++    );
++  if (!hasCase)
++    return (
++      <Empty
++        title="Create a case first"
++        action={
++          <Link className="button primary" href="/cases">
++            Go to my cases
++          </Link>
++        }
++      >
++        Each case has its own answers, legal routes and checklist.
++      </Empty>
++    );
++  return <>{children}</>;
++}
++function CasePicker({
++  caseId,
++  setSelected,
++}: {
++  caseId: number;
++  setSelected: (id: number) => void;
++}) {
++  const { data } = useWorkspace();
++  if (data.cases.length < 2) return null;
++  return (
++    <label className="case-selector">
++      <FolderHeart size={15} />
++      <select
++        aria-label="Choose case"
++        value={caseId}
++        onChange={(e) => setSelected(Number(e.target.value))}
++      >
++        {data.cases.map((c) => (
++          <option key={c.id} value={c.id}>
++            {c.title}
++          </option>
++        ))}
++      </select>
++    </label>
++  );
++}
++
++export function IntakeView() {
++  const { data, demo, caseId, setSelectedCase } = useJourneyCase();
++  const { setNotice } = useWorkspace();
++  const router = useRouter();
++  const [answers, setAnswers] = useState<Intake>(blank);
++  const [saving, setSaving] = useState(false);
++  const [error, setError] = useState("");
++  useEffect(() => {
++    if (demo || !caseId) return;
++    let live = true;
++    api<{ intake: { answers: Intake } }>(`cases/${caseId}/intake`)
++      .then((r) => live && setAnswers({ ...blank, ...r.intake.answers }))
++      .catch((e) => live && setError((e as Error).message));
++    return () => {
++      live = false;
++    };
++  }, [caseId, demo]);
++  const set = (patch: Partial<Intake>) => setAnswers((a) => ({ ...a, ...patch }));
++  function togglePending(value: string) {
++    const current = answers.pendingProceedings;
++    let next: string[];
++    if (value === "none" || value === "unknown") next = [value];
++    else {
++      const base = current.filter((p) => p !== "none" && p !== "unknown");
++      next = base.includes(value)
++        ? base.filter((p) => p !== value)
++        : [...base, value];
++    }
++    set({ pendingProceedings: next.length ? next : ["unknown"] });
++  }
++  async function save(event: React.FormEvent) {
++    event.preventDefault();
++    setSaving(true);
++    setError("");
++    try {
++      await api(`cases/${caseId}/intake`, answers);
++      setNotice("Your answers are saved. Here are the legal routes that may apply.");
++      router.push("/navigator");
++    } catch (e) {
++      setError((e as Error).message);
++    } finally {
++      setSaving(false);
++    }
++  }
++  const done = answerable(answers);
++  return (
++    <>
++      <PageHeading
++        eyebrow="START HERE"
++        title="Tell us where things stand."
++        description="A few simple questions help us show the routes that may apply. “I don’t know” is always okay."
++      >
++        <CasePicker caseId={caseId} setSelected={setSelectedCase} />
++      </PageHeading>
++      <JourneyGate demo={demo} hasCase={data.cases.length > 0}>
++        <form className="panel" onSubmit={save} noValidate>
++          <div className="panel-heading">
++            <div>
++              <h2>Guided intake</h2>
++              <p>
++                {done} of {questions.length + 2} answered · saved only when you
++                press Save.
++              </p>
++            </div>
++          </div>
++          {(answers.safetyRisk === "immediate" ||
++            answers.safetyRisk === "yes") && (
++            <div className="callout warning" role="alert">
++              <strong>Your safety comes first.</strong> If you are in immediate
++              danger, call 112 or the NALSA legal-aid helpline 15100. You can
++              finish this form later.
++            </div>
++          )}
++          {questions.slice(0, 2).map((q) => (
++            <Question key={q.key} q={q} answers={answers} set={set} />
++          ))}
++          <fieldset className="field">
++            <legend>Is any case already pending? (choose all that apply)</legend>
++            {pendingOptions.map((o) => (
++              <label key={o.value} className="choice">
++                <input
++                  type="checkbox"
++                  checked={answers.pendingProceedings.includes(o.value)}
++                  onChange={() => togglePending(o.value)}
++                />
++                {o.label}
++              </label>
++            ))}
++          </fieldset>
++          {questions.slice(2).map((q) => (
++            <Question key={q.key} q={q} answers={answers} set={set} />
++          ))}
++          <div className="field">
++            <label htmlFor="intake-location">
++              Where are you located? (city or state)
++            </label>
++            <input
++              id="intake-location"
++              value={answers.location}
++              maxLength={80}
++              pattern="[\p{L}\p{N} .,'\-]{0,80}"
++              autoComplete="off"
++              onChange={(e) => set({ location: e.target.value })}
++            />
++            <small>Used to point you to the right legal-aid office.</small>
++          </div>
++          {error && (
++            <div className="callout warning" role="alert">
++              {error}
++            </div>
++          )}
++          <div className="panel-footnote">
++            <ShieldCheck size={15} /> Only these answers are stored, and only in
++            your own case.
++          </div>
++          <button className="button primary" disabled={saving}>
++            {saving ? "Saving…" : "Save and see my legal routes"}
++          </button>
++        </form>
++      </JourneyGate>
++    </>
++  );
++}
++function Question({
++  q,
++  answers,
++  set,
++}: {
++  q: (typeof questions)[number];
++  answers: Intake;
++  set: (p: Partial<Intake>) => void;
++}) {
++  return (
++    <fieldset className="field">
++      <legend>{q.label}</legend>
++      {q.options.map((o) => (
++        <label key={o.value} className="choice">
++          <input
++            type="radio"
++            name={q.key}
++            value={o.value}
++            checked={answers[q.key] === o.value}
++            onChange={() => set({ [q.key]: o.value } as Partial<Intake>)}
++          />
++          {o.label}
++        </label>
++      ))}
++    </fieldset>
++  );
++}
++
++type Route = {
++  id: string;
++  title: string;
++  explainer: string;
++  reasons: string[];
++  questionsForCounsel: string[];
++  source: { title: string; url: string; effectiveFrom: string | null; reviewedOn: string; reviewStatus: string };
++};
++type Navigator = {
++  safetyFirst: boolean;
++  safety: { title: string; message: string; contacts: { label: string; value: string }[]; note: string } | null;
++  routes: Route[];
++  needsMoreInfo: string[];
++  overlapWarning: string | null;
++  existingOrderNote: string | null;
++  legalAid: { title: string; helpline: string; explainer: string; source: Route["source"] };
++  disclaimer: string;
++};
++const safeUrl = (url: string) => (/^https:\/\//.test(url) ? url : "");
++
++export function NavigatorView() {
++  const { data, demo, caseId, setSelectedCase } = useJourneyCase();
++  const [nav, setNav] = useState<Navigator | null>(null);
++  const [saved, setSaved] = useState(true);
++  const [error, setError] = useState("");
++  useEffect(() => {
++    if (demo || !caseId) return;
++    let live = true;
++    setNav(null);
++    setError("");
++    api<{ navigator: Navigator; intakeSaved: boolean }>(`cases/${caseId}/navigator`)
++      .then((r) => {
++        if (!live) return;
++        setNav(r.navigator);
++        setSaved(r.intakeSaved);
++      })
++      .catch((e) => live && setError((e as Error).message));
++    return () => {
++      live = false;
++    };
++  }, [caseId, demo]);
++  return (
++    <>
++      <PageHeading
++        eyebrow="LEGAL ROUTES"
++        title="Routes that may apply to you."
++        description="Based on your answers. These are possibilities to discuss with a lawyer, not a decision about what you are owed."
++      >
++        <CasePicker caseId={caseId} setSelected={setSelectedCase} />
++      </PageHeading>
++      <JourneyGate demo={demo} hasCase={data.cases.length > 0}>
++        {error && (
++          <div className="callout warning" role="alert">
++            {error}
++          </div>
++        )}
++        {!saved && (
++          <div className="callout">
++            You haven’t answered the intake questions yet, so these routes are
++            general. <Link href="/intake">Answer them now</Link> to narrow them
++            down.
++          </div>
++        )}
++        {nav?.safetyFirst && nav.safety && (
++          <section className="panel" role="alert">
++            <h2>
++              <CircleAlert size={18} /> {nav.safety.title}
++            </h2>
++            <p>{nav.safety.message}</p>
++            {nav.safety.contacts.map((c) => (
++              <p key={c.label}>
++                <Phone size={14} /> {c.label}: <strong>{c.value}</strong>
++              </p>
++            ))}
++            <p className="small muted">{nav.safety.note}</p>
++          </section>
++        )}
++        {nav && (
++          <>
++            {nav.overlapWarning && (
++              <div className="callout warning">{nav.overlapWarning}</div>
++            )}
++            {nav.existingOrderNote && (
++              <div className="callout">{nav.existingOrderNote}</div>
++            )}
++            {nav.needsMoreInfo.length > 0 && (
++              <div className="callout">
++                Your marriage type or current status is unclear, so more routes
++                may apply. A lawyer can help narrow them down.
++              </div>
++            )}
++            {nav.routes.map((r) => (
++              <section className="panel" key={r.id}>
++                <div className="panel-heading">
++                  <div>
++                    <h2>{r.title}</h2>
++                    <p>{r.explainer}</p>
++                  </div>
++                  <Badge tone="amber">Possible route</Badge>
++                </div>
++                <p className="small">
++                  <strong>Why it’s shown:</strong> {r.reasons.join(" ")}
++                </p>
++                <p className="small">
++                  <strong>Questions to ask a lawyer</strong>
++                </p>
++                <ul className="small">
++                  {r.questionsForCounsel.map((q) => (
++                    <li key={q}>{q}</li>
++                  ))}
++                </ul>
++                <p className="small muted">
++                  Source: {r.source.title}
++                  {r.source.effectiveFrom ? ` · effective ${r.source.effectiveFrom}` : ""}{" "}
++                  · reviewed {r.source.reviewedOn} · awaiting legal review{" "}
++                  {safeUrl(r.source.url) && (
++                    <ExternalLink href={r.source.url}>Open source</ExternalLink>
++                  )}
++                </p>
++              </section>
++            ))}
++            <section className="panel">
++              <div className="panel-heading">
++                <div>
++                  <h2>{nav.legalAid.title}</h2>
++                  <p>{nav.legalAid.explainer}</p>
++                </div>
++                <Badge>Helpline {nav.legalAid.helpline}</Badge>
++              </div>
++              {safeUrl(nav.legalAid.source.url) && (
++                <ExternalLink href={nav.legalAid.source.url}>
++                  NALSA: assistance for women
++                </ExternalLink>
++              )}
++            </section>
++            <p className="small muted">{nav.disclaimer}</p>
++          </>
++        )}
++      </JourneyGate>
++    </>
++  );
++}
++
++type ChecklistItem = {
++  key: string;
++  label: string;
++  examples: string[];
++  priority: string;
++  added: number;
++  status: "added" | "to_add";
++  note?: string;
++};
++export function ReadinessChecklist({
++  caseId,
++  refreshKey,
++  onAdd,
++}: {
++  caseId: number;
++  refreshKey: number;
++  onAdd: () => void;
++}) {
++  const [items, setItems] = useState<ChecklistItem[] | null>(null);
++  const [guidance, setGuidance] = useState("");
++  const [error, setError] = useState("");
++  const load = useCallback(async () => {
++    try {
++      const r = await api<{
++        checklist: { items: ChecklistItem[]; guidance: string };
++      }>(`cases/${caseId}/checklist`);
++      setItems(r.checklist.items);
++      setGuidance(r.checklist.guidance);
++      setError("");
++    } catch (e) {
++      setError((e as Error).message);
++    }
++  }, [caseId]);
++  useEffect(() => {
++    void load();
++  }, [load, refreshKey]);
++  return (
++    <section className="panel readiness-panel">
++      <h2>Your readiness checklist</h2>
++      <p className="muted">
++        Built from your intake answers. Nothing here is verified automatically.
++      </p>
++      {error && (
++        <div className="callout warning" role="alert">
++          {error}
++        </div>
++      )}
++      {items?.map((item) => (
++        <div className="checklist-item" key={item.key}>
++          <span className={item.added ? "check-circle done" : "check-circle"}>
++            {item.added > 0 && <Check size={12} />}
++          </span>
++          <div>
++            <strong>{item.label}</strong>
++            <small>
++              {item.added
++                ? `${item.added} added · not verified`
++                : item.priority === "start"
++                  ? "A good place to start"
++                  : "Add if relevant and available"}
++              {" · "}
++              {item.examples.join(", ")}
++            </small>
++            {item.note && <small>{item.note}</small>}
++          </div>
++        </div>
++      ))}
++      <p className="small muted mt-5">{guidance}</p>
++      <button className="button secondary" onClick={onAdd}>
++        Add a document
++      </button>
++    </section>
++  );
++}
+diff --git a/frontend/src/components/record-dialog.tsx b/frontend/src/components/record-dialog.tsx
+index f4453b6..040d8ec 100644
+--- a/frontend/src/components/record-dialog.tsx
++++ b/frontend/src/components/record-dialog.tsx
+@@ -411,6 +411,9 @@ export function RecordDialog({
+                 <option>Payment proof</option>
+                 <option>Financial record</option>
+                 <option>Identity / relationship</option>
++                <option>Assets and liabilities</option>
++                <option>Child expenses</option>
++                <option>Safety record</option>
+                 <option>Other</option>
+               </select>
+             </Field>
+diff --git a/frontend/src/components/workspace-app.tsx b/frontend/src/components/workspace-app.tsx
+index 3137ff8..e90be80 100644
+--- a/frontend/src/components/workspace-app.tsx
++++ b/frontend/src/components/workspace-app.tsx
+@@ -32,12 +32,19 @@ import {
+   Bell,
+   SlidersHorizontal,
+   BookOpen,
++  ClipboardList,
++  Compass,
+ } from "lucide-react";
+ import { useWorkspace } from "./workspace-provider";
+ import { Badge, Empty, PageHeading, ExternalLink } from "./ui";
+ import { RecordDialog, type DialogKind } from "./record-dialog";
+ import { buildLedger, dateLabel, downloadJson, money } from "@/lib/ledger";
+ import type { LedgerRow, SourceRecord } from "@/lib/types";
++import {
++  IntakeView,
++  NavigatorView,
++  ReadinessChecklist,
++} from "./journey-views";
+ import {
+   CalculatorView,
+   DataReviewView,
+@@ -48,6 +55,8 @@ import {
+ 
+ const nav = [
+   { id: "dashboard", title: "Overview", icon: LayoutDashboard },
++  { id: "intake", title: "Start here", icon: ClipboardList },
++  { id: "navigator", title: "Legal routes", icon: Compass },
+   { id: "cases", title: "My cases", icon: FolderHeart },
+   { id: "orders", title: "Court orders", icon: Scale },
+   { id: "payments", title: "Maintenance", icon: Wallet },
+@@ -56,6 +65,8 @@ const nav = [
+ ];
+ const pageTitles: Record<string, string> = {
+   dashboard: "Overview",
++  intake: "Start here",
++  navigator: "Legal routes",
+   cases: "My cases",
+   orders: "Court orders",
+   payments: "Maintenance",
+@@ -1071,7 +1082,7 @@ export function WorkspaceApp({ section }: { section: string }) {
+                       <p>
+                         {demo
+                           ? "Illustrative records. Add a synthetic file to try the workflow."
+-                          : "Files uploaded in this session. The service has no document-list endpoint yet."}
++                          : "Documents saved to your case. Downloads need your signed-in session."}
+                       </p>
+                     </div>
+                     <CaseSelector
+@@ -1132,56 +1143,66 @@ export function WorkspaceApp({ section }: { section: string }) {
+                       : "Downloads require your authenticated session."}
+                   </div>
+                 </section>
++                {!demo && (selectedCase || data.cases[0]?.id) ? (
++                  <ReadinessChecklist
++                    caseId={selectedCase || data.cases[0].id}
++                    refreshKey={documents.length}
++                    onAdd={() => open("document")}
++                  />
++                ) : (
+                 <section className="panel readiness-panel">
+-                  <span className="small-emblem">
+-                    <Files size={21} />
+-                  </span>
+-                  <h2>
+-                    A little preparation
+-                    <br />
+-                    goes a long way.
+-                  </h2>
+-                  <p className="muted">
+-                    A starting checklist to discuss with your legal
+-                    professional.
+-                  </p>
+-                  {[
+-                    "Identity / relationship",
+-                    "Financial record",
+-                    "Court order",
+-                    "Payment proof",
+-                  ].map((category) => {
+-                    const done = documents.some(
+-                      (d) => d.documentType === category,
+-                    );
+-                    return (
+-                      <div className="checklist-item" key={category}>
+-                        <span
+-                          className={
+-                            done ? "check-circle done" : "check-circle"
+-                          }
+-                        >
+-                          {done && <Check size={12} />}
+-                        </span>
+-                        <div>
+-                          <strong>{category}</strong>
+-                          <small>
+-                            {done
+-                              ? "Record added · not verified"
+-                              : "Add if relevant and available"}
+-                          </small>
++                    <span className="small-emblem">
++                      <Files size={21} />
++                    </span>
++                    <h2>
++                      A little preparation
++                      <br />
++                      goes a long way.
++                    </h2>
++                    <p className="muted">
++                      A starting checklist to discuss with your legal
++                      professional.
++                    </p>
++                    {[
++                      "Identity / relationship",
++                      "Financial record",
++                      "Court order",
++                      "Payment proof",
++                    ].map((category) => {
++                      const done = documents.some(
++                        (d) => d.documentType === category,
++                      );
++                      return (
++                        <div className="checklist-item" key={category}>
++                          <span
++                            className={
++                              done ? "check-circle done" : "check-circle"
++                            }
++                          >
++                            {done && <Check size={12} />}
++                          </span>
++                          <div>
++                            <strong>{category}</strong>
++                            <small>
++                              {done
++                                ? "Record added · not verified"
++                                : "Add if relevant and available"}
++                            </small>
++                          </div>
+                         </div>
+-                      </div>
+-                    );
+-                  })}
+-                  <p className="small muted mt-5">
+-                    Missing information is okay. Only provide what is needed and
+-                    available.
+-                  </p>
+-                </section>
++                      );
++                    })}
++                    <p className="small muted mt-5">
++                      Missing information is okay. Only provide what is needed and
++                      available.
++                    </p>
++                  </section>
++                )}
+               </div>
+             </>
+           )}
++          {section === "intake" && <IntakeView />}
++          {section === "navigator" && <NavigatorView />}
+           {section === "calculator" && <CalculatorView />}
+           {section === "data-review" && (
+             <DataReviewView
+diff --git a/frontend/src/components/workspace-provider.tsx b/frontend/src/components/workspace-provider.tsx
+index aa446a9..ec5de10 100644
+--- a/frontend/src/components/workspace-provider.tsx
++++ b/frontend/src/components/workspace-provider.tsx
+@@ -18,6 +18,7 @@ import type {
+   Proceeding,
+   Order,
+   Payment,
++  DocumentRecord,
+ } from "@/lib/types";
+ const empty = (): Workspace => ({
+   cases: [],
+@@ -91,8 +92,22 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
+       )
+         .flatMap((r) => r.payments)
+         .map((p) => ({ ...p, amount: Number(p.amount) }));
++      const documents = (
++        await Promise.all(
++          cases.map((c) =>
++            api<{ documents: DocumentRecord[] }>(`documents/case/${c.id}`),
++          ),
++        )
++      ).flatMap((r) => r.documents);
+       if (generation === requestGeneration.current)
+-        setData((prev) => ({ ...prev, cases, proceedings, orders, payments }));
++        setData((prev) => ({
++          ...prev,
++          cases,
++          proceedings,
++          orders,
++          payments,
++          documents,
++        }));
+     } catch (err) {
+       if (generation === requestGeneration.current)
+         setError((err as Error).message);
+diff --git a/frontend/tests/proxy.test.ts b/frontend/tests/proxy.test.ts
+index 5c35df2..2da64d6 100644
+--- a/frontend/tests/proxy.test.ts
++++ b/frontend/tests/proxy.test.ts
+@@ -104,3 +104,40 @@ describe("same-origin backend adapter", () => {
+     expect((await response.json()).cases).toBeUndefined();
+   });
+ });
++
++describe("intake, navigator and checklist routes", () => {
++  beforeEach(() => {
++    vi.resetAllMocks();
++    vi.stubGlobal("fetch", vi.fn());
++  });
++  it("forwards the new read routes only with a session", async () => {
++    for (const path of [
++      "cases/7/intake",
++      "cases/7/navigator",
++      "cases/7/checklist",
++      "documents/case/7",
++    ]) {
++      const result = await GET(
++        new NextRequest(`${base}/api/backend/${path}`),
++        ctx(path),
++      );
++      expect(result.status).toBe(401);
++    }
++    expect(fetch).not.toHaveBeenCalled();
++  });
++  it("still rejects unknown sub-paths and cross-origin intake saves", async () => {
++    const unknown = await GET(
++      new NextRequest(`${base}/api/backend/cases/7/anything`),
++      ctx("cases/7/anything"),
++    );
++    expect(unknown.status).toBe(404);
++    const crossOrigin = await POST(
++      new NextRequest(`${base}/api/backend/cases/7/intake`, {
++        method: "POST",
++        headers: { origin: "https://other.example" },
++      }),
++      ctx("cases/7/intake"),
++    );
++    expect(crossOrigin.status).toBe(403);
++  });
++});

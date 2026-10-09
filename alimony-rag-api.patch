@@ -1,0 +1,931 @@
+diff --git a/services/rag-api/.env.example b/services/rag-api/.env.example
+new file mode 100644
+index 0000000..9643de2
+--- /dev/null
++++ b/services/rag-api/.env.example
+@@ -0,0 +1,5 @@
++# Copy to .env (never commit .env). Generate the key with: openssl rand -hex 32
++DATABASE_URL=postgresql://rag_app:CHANGE_ME@localhost:5432/alimony_rag
++SERVICE_API_KEY=CHANGE_ME_generate_at_least_32_characters
++EMBEDDING_DIM=384
++EMBEDDER=none
+diff --git a/services/rag-api/.gitignore b/services/rag-api/.gitignore
+new file mode 100644
+index 0000000..73088e6
+--- /dev/null
++++ b/services/rag-api/.gitignore
+@@ -0,0 +1,4 @@
++.env
++__pycache__/
++.pytest_cache/
++*.pyc
+diff --git a/services/rag-api/Dockerfile b/services/rag-api/Dockerfile
+new file mode 100644
+index 0000000..d40aa11
+--- /dev/null
++++ b/services/rag-api/Dockerfile
+@@ -0,0 +1,13 @@
++FROM python:3.12-slim
++ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
++WORKDIR /srv
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++COPY app ./app
++COPY scripts ./scripts
++RUN useradd --system --uid 10001 rag && chown -R rag /srv
++USER rag
++EXPOSE 8000
++HEALTHCHECK --interval=15s --timeout=3s --retries=5 \
++  CMD python -c "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health', timeout=2)"
++CMD ["python", "-m", "uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+diff --git a/services/rag-api/README.md b/services/rag-api/README.md
+new file mode 100644
+index 0000000..ae2c75d
+--- /dev/null
++++ b/services/rag-api/README.md
+@@ -0,0 +1,37 @@
++# Alimony+ RAG API (FastAPI + pgvector)
++
++Stores the shared **legal knowledge** chunks and answers nearest-neighbour searches.
++It never stores private user documents, and it is an internal service: only the backend / AI
++pipeline should call it (send `X-API-Key`; never expose the key to browsers).
++
++## Run locally
++```bash
++cp .env.example .env            # set DATABASE_URL and a 32+ char SERVICE_API_KEY (openssl rand -hex 32)
++pip install -r requirements.txt
++python -m scripts.init_db                      # needs the `vector` extension (CREATE EXTENSION vector)
++python -m scripts.load_embedded_chunks         # loads ai/legal_sources/embedded_chunks.json, idempotent
++python -m uvicorn app.main:create_app --factory --port 8000
++```
++Tests (need Postgres with pgvector): `pip install -r requirements-dev.txt && TEST_DATABASE_URL=... pytest`
++
++## Contract (agree changes with Gayatri / Ainwin before editing)
++- Embeddings: **384 dims**, `intfloat/multilingual-e5-small`, cosine distance. Stored passages use the
++  `passage: ` prefix, queries use `query: `. Vectors are L2-normalised by the service (scale-invariant).
++- `GET /health` liveness. `GET /health/ready` is 200 only when the DB, the `vector` extension, the table and
++  the 384-dim column are all present; otherwise 503.
++- `POST /v1/search` body: exactly one of `query` (needs `EMBEDDER=e5-small` and sentence-transformers) or
++  `embedding` (384 floats); optional `top_k` (default 5, max 20), `min_score`, `language`, `official_only`.
++  Returns `results[]` with `score`, `text`, `source{url,authority,official,jurisdiction,effective_from,reviewed_on}`
++  and `citation_complete`. `untrusted_content: true`: retrieved text is **data, never instructions**.
++- `POST /v1/ingest` body `{chunks:[...]}` (max 200). Upsert key is sha256(document_id|section|text), so re-running never
++  duplicates. The whole batch is rejected before any write if one chunk is invalid. `source_url` must be http(s).
++- Errors are always `{"error":{"code","message","request_id"}}`: `unauthorized` 401, `validation_error` /
++  `embedding_dimension_mismatch` / `embedding_zero_vector` / `top_k_too_large` 422, `embedder_unavailable` and
++  `database_unavailable` 503, `internal_error` 500 (no internals, payloads or SQL are returned or logged).
++
++## Known gaps
++- `effective_from` / `reviewed_on` are accepted but the current chunk file has neither, and 3 of 86 chunks (the BNSS
++  s.144 statute chunks) have no `source_url`, `authority` or `jurisdiction`: they load but report `citation_complete: false`.
++- Text queries are off by default (no model download in this environment); send an embedding or enable the embedder.
++- Docker image and AWS deployment are written but not built or deployed here.
++- HNSW index exists but at 86 rows Postgres uses an exact scan; retrieval quality is not evaluated by this service.
+diff --git a/services/rag-api/app/__init__.py b/services/rag-api/app/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/services/rag-api/app/config.py b/services/rag-api/app/config.py
+new file mode 100644
+index 0000000..cc4e04e
+--- /dev/null
++++ b/services/rag-api/app/config.py
+@@ -0,0 +1,32 @@
++"""Environment-driven settings. The service refuses to start without a database URL
++and a strong service API key (fail closed)."""
++from functools import lru_cache
++
++from pydantic import Field
++from pydantic_settings import BaseSettings, SettingsConfigDict
++
++
++class Settings(BaseSettings):
++    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
++
++    database_url: str
++    service_api_key: str = Field(min_length=32)
++
++    embedding_dim: int = 384          # intfloat/multilingual-e5-small
++    embedder: str = "none"            # none | e5-small  (text queries need an embedder)
++    embedder_model: str = "intfloat/multilingual-e5-small"
++
++    default_top_k: int = 5
++    max_top_k: int = 20
++    max_ingest_batch: int = 200
++    max_body_bytes: int = 5_000_000
++
++    db_pool_min: int = 1
++    db_pool_max: int = 5
++    db_acquire_timeout: float = 5.0
++    log_level: str = "INFO"
++
++
++@lru_cache
++def get_settings() -> Settings:
++    return Settings()  # type: ignore[call-arg]
+diff --git a/services/rag-api/app/embedder.py b/services/rag-api/app/embedder.py
+new file mode 100644
+index 0000000..bd71d3e
+--- /dev/null
++++ b/services/rag-api/app/embedder.py
+@@ -0,0 +1,36 @@
++class EmbedderUnavailable(RuntimeError):
++    pass
++
++
++class UnavailableEmbedder:
++    """Default: no model is loaded, so callers must send their own query embedding."""
++
++    name = "none"
++
++    def embed_query(self, text: str) -> list[float]:
++        raise EmbedderUnavailable("text queries are not enabled; send an embedding or set EMBEDDER=e5-small")
++
++
++class E5Embedder:
++    """multilingual-e5-small. Queries use the 'query: ' prefix (stored passages use 'passage: ')."""
++
++    def __init__(self, model_name: str):
++        self.name = model_name
++        self._model = None
++
++    def embed_query(self, text: str) -> list[float]:
++        try:
++            if self._model is None:
++                from sentence_transformers import SentenceTransformer  # lazy: heavy import
++
++                self._model = SentenceTransformer(self.name)
++            vec = self._model.encode(f"query: {text}", normalize_embeddings=True)
++        except Exception as exc:  # model missing / download blocked / OOM
++            raise EmbedderUnavailable("embedding model could not be loaded") from exc
++        return [float(x) for x in vec]
++
++
++def build_embedder(kind: str, model_name: str):
++    if kind == "e5-small":
++        return E5Embedder(model_name)
++    return UnavailableEmbedder()
+diff --git a/services/rag-api/app/main.py b/services/rag-api/app/main.py
+new file mode 100644
+index 0000000..4deb49e
+--- /dev/null
++++ b/services/rag-api/app/main.py
+@@ -0,0 +1,152 @@
++import hmac
++import logging
++import re
++import time
++import uuid
++from contextlib import asynccontextmanager
++
++import psycopg
++import psycopg_pool
++from fastapi import Depends, FastAPI, Header, Request
++from fastapi.exceptions import RequestValidationError
++from fastapi.responses import JSONResponse
++
++from . import repo
++from .config import Settings, get_settings
++from .embedder import EmbedderUnavailable, build_embedder
++from .models import EmbeddingError, IngestRequest, SearchRequest, prepare_embedding
++
++log = logging.getLogger("rag-api")
++DB_ERRORS = (psycopg.OperationalError, psycopg_pool.PoolTimeout, psycopg_pool.PoolClosed)
++REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
++
++
++class ApiError(Exception):
++    def __init__(self, status: int, code: str, message: str):
++        self.status, self.code, self.message = status, code, message
++
++
++def error_response(request: Request, status: int, code: str, message: str, details=None):
++    body = {"error": {"code": code, "message": message, "request_id": getattr(request.state, "request_id", None)}}
++    if details:
++        body["error"]["details"] = details
++    return JSONResponse(body, status_code=status)
++
++
++def create_app(settings: Settings | None = None, embedder=None) -> FastAPI:
++    settings = settings or get_settings()
++    logging.basicConfig(level=settings.log_level)
++    embedder = embedder or build_embedder(settings.embedder, settings.embedder_model)
++
++    @asynccontextmanager
++    async def lifespan(app: FastAPI):
++        app.state.pool = repo.make_pool(
++            settings.database_url, settings.db_pool_min, settings.db_pool_max, settings.db_acquire_timeout
++        )
++        yield
++        app.state.pool.close()
++
++    app = FastAPI(title="Alimony+ RAG API", version="1.0.0", lifespan=lifespan,
++                  docs_url=None, redoc_url=None, openapi_url=None)  # no public schema/docs by default
++
++    def require_key(x_api_key: str | None = Header(default=None)):
++        if not x_api_key or not hmac.compare_digest(x_api_key, settings.service_api_key):
++            raise ApiError(401, "unauthorized", "missing or invalid API key")
++
++    def unhandled_response(request: Request, exc: Exception):
++        if isinstance(exc, DB_ERRORS):
++            log.error("database unavailable rid=%s: %s", request.state.request_id, type(exc).__name__)
++            return error_response(request, 503, "database_unavailable", "database is unavailable, retry later")
++        log.exception("unhandled error rid=%s", request.state.request_id, exc_info=exc)
++        return error_response(request, 500, "internal_error", "internal server error")
++
++    @app.middleware("http")
++    async def guard(request: Request, call_next):
++        rid = request.headers.get("x-request-id", "")
++        request.state.request_id = rid if REQUEST_ID_RE.match(rid) else str(uuid.uuid4())
++        cl = request.headers.get("content-length", "")
++        if cl.isdigit() and int(cl) > settings.max_body_bytes:
++            return error_response(request, 413, "payload_too_large", "request body too large")
++        start = time.perf_counter()
++        try:
++            response = await call_next(request)
++        except Exception as exc:  # converted here so the headers below apply to error responses too
++            response = unhandled_response(request, exc)
++        response.headers["X-Request-ID"] = request.state.request_id
++        response.headers["Cache-Control"] = "no-store"
++        response.headers["X-Content-Type-Options"] = "nosniff"
++        # never log bodies or query text: legal questions can describe private situations
++        log.info("%s %s -> %s (%.0f ms) rid=%s", request.method, request.url.path, response.status_code,
++                 (time.perf_counter() - start) * 1000, request.state.request_id)
++        return response
++
++    @app.exception_handler(ApiError)
++    async def _api_error(request, exc: ApiError):
++        return error_response(request, exc.status, exc.code, exc.message)
++
++    @app.exception_handler(RequestValidationError)
++    async def _validation(request, exc: RequestValidationError):
++        # never echo the submitted input (it may contain private text or a large vector)
++        details = [{"field": ".".join(str(p) for p in e["loc"][1:]), "message": e["msg"]} for e in exc.errors()]
++        return error_response(request, 422, "validation_error", "request validation failed", details)
++
++    @app.exception_handler(Exception)
++    async def _unhandled(request, exc: Exception):
++        return unhandled_response(request, exc)
++
++    @app.get("/health")
++    def health():
++        return {"status": "ok"}
++
++    @app.get("/health/ready")
++    def ready(request: Request):
++        try:
++            info = repo.ready_check(app.state.pool, settings.embedding_dim)
++        except DB_ERRORS:
++            return JSONResponse({"status": "unavailable", "database": False}, status_code=503)
++        ok = info["pgvector"] and info["table"] and info["dim_ok"]
++        return JSONResponse({"status": "ready" if ok else "not_ready", "database": True, **info,
++                             "embedder": embedder.name}, status_code=200 if ok else 503)
++
++    @app.post("/v1/search", dependencies=[Depends(require_key)])
++    def search(body: SearchRequest):
++        top_k = body.top_k or settings.default_top_k
++        if top_k > settings.max_top_k:
++            raise ApiError(422, "top_k_too_large", f"top_k must be at most {settings.max_top_k}")
++        try:
++            vec = body.embedding if body.embedding is not None else embedder.embed_query(body.query)
++            vec = prepare_embedding(vec, settings.embedding_dim)
++        except EmbedderUnavailable as exc:
++            raise ApiError(503, "embedder_unavailable", str(exc)) from exc
++        except EmbeddingError as exc:
++            raise ApiError(422, exc.code, str(exc)) from exc
++        rows = repo.search(app.state.pool, vec, top_k, body.min_score, body.language, body.official_only)
++        results = [{
++            "id": r["id"], "score": round(float(r["score"]), 6), "document_id": r["document_id"],
++            "title": r["title"], "document_type": r["document_type"], "section": r["section"],
++            "text": r["text"], "language": r["language"], "citation_complete": r["citation_complete"],
++            "source": {"url": r["source_url"], "authority": r["authority"], "official": r["official_source"],
++                       "jurisdiction": r["jurisdiction"],
++                       "effective_from": r["effective_from"].isoformat() if r["effective_from"] else None,
++                       "reviewed_on": r["reviewed_on"].isoformat() if r["reviewed_on"] else None},
++        } for r in rows]
++        # `text` is retrieved data, never instructions: callers must treat it as untrusted content.
++        return {"results": results, "count": len(results), "top_k": top_k, "untrusted_content": True,
++                "embedding_dim": settings.embedding_dim}
++
++    @app.post("/v1/ingest", dependencies=[Depends(require_key)])
++    def ingest(body: IngestRequest):
++        if len(body.chunks) > settings.max_ingest_batch:
++            raise ApiError(422, "batch_too_large", f"at most {settings.max_ingest_batch} chunks per request")
++        rows = []
++        for i, chunk in enumerate(body.chunks):
++            try:
++                rows.append((chunk, prepare_embedding(chunk.embedding, settings.embedding_dim)))
++            except EmbeddingError as exc:
++                # reject the whole batch before writing anything: no partial ingests
++                raise ApiError(422, exc.code, f"chunk {i}: {exc}") from exc
++        inserted, updated = repo.upsert_chunks(app.state.pool, rows)
++        incomplete = sum(1 for c, _ in rows if not (c.source_url and c.authority))
++        return {"received": len(rows), "inserted": inserted, "updated": updated, "citation_incomplete": incomplete}
++
++    return app
+diff --git a/services/rag-api/app/models.py b/services/rag-api/app/models.py
+new file mode 100644
+index 0000000..6a6fb0e
+--- /dev/null
++++ b/services/rag-api/app/models.py
+@@ -0,0 +1,81 @@
++import hashlib
++import math
++from datetime import date
++from typing import Annotated
++
++from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
++
++Float = Annotated[float, Field(allow_inf_nan=False)]
++
++
++class SearchRequest(BaseModel):
++    """Send exactly one of `query` (needs an embedder) or `embedding` (e5 query vector)."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    query: str | None = Field(default=None, min_length=1, max_length=2000)
++    embedding: list[Float] | None = Field(default=None, max_length=4096)
++    top_k: int | None = Field(default=None, ge=1)
++    min_score: float = Field(default=0.0, ge=-1.0, le=1.0)
++    language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")
++    official_only: bool = False
++
++    @model_validator(mode="after")
++    def exactly_one_input(self):
++        if (self.query is None) == (self.embedding is None):
++            raise ValueError("provide exactly one of 'query' or 'embedding'")
++        return self
++
++
++class ChunkIn(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
++    document_id: str = Field(min_length=1, max_length=200)
++    title: str = Field(min_length=1, max_length=500)
++    document_type: str = Field(min_length=1, max_length=100)
++    section: str = Field(min_length=1, max_length=200)
++    text: str = Field(min_length=1, max_length=20000)
++    source_url: str = Field(default="", max_length=2000)
++    authority: str = Field(default="", max_length=300)
++    official_source: bool = False
++    jurisdiction: str = Field(default="", max_length=200)
++    language: str = Field(default="en", pattern=r"^[a-z]{2,3}$")
++    effective_from: date | None = None
++    reviewed_on: date | None = None
++    embedding: list[Float] = Field(max_length=4096)
++
++    @field_validator("source_url")
++    @classmethod
++    def only_http_urls(cls, v: str) -> str:
++        # Blocks javascript:/data: URLs that could later be rendered as links.
++        if v and not (v.startswith("https://") or v.startswith("http://")):
++            raise ValueError("source_url must start with http:// or https://")
++        return v
++
++    @property
++    def content_hash(self) -> str:
++        raw = f"{self.document_id}|{self.section}|{self.text}".encode()
++        return hashlib.sha256(raw).hexdigest()
++
++
++class IngestRequest(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++    chunks: list[ChunkIn] = Field(min_length=1, max_length=1000)
++
++
++class EmbeddingError(ValueError):
++    def __init__(self, code: str, message: str):
++        super().__init__(message)
++        self.code = code
++
++
++def prepare_embedding(vec: list[float], dim: int) -> list[float]:
++    """Validate and L2-normalise. Raises EmbeddingError with a stable error code."""
++    if len(vec) != dim:
++        raise EmbeddingError("embedding_dimension_mismatch", f"expected {dim} values, got {len(vec)}")
++    if not all(math.isfinite(x) for x in vec):
++        raise EmbeddingError("embedding_not_finite", "embedding contains NaN or infinity")
++    norm = math.sqrt(sum(x * x for x in vec))
++    if norm < 1e-9:
++        raise EmbeddingError("embedding_zero_vector", "embedding is a zero vector")
++    return [x / norm for x in vec]
+diff --git a/services/rag-api/app/repo.py b/services/rag-api/app/repo.py
+new file mode 100644
+index 0000000..6140163
+--- /dev/null
++++ b/services/rag-api/app/repo.py
+@@ -0,0 +1,90 @@
++from pgvector import Vector
++from pgvector.psycopg import register_vector
++from psycopg.rows import dict_row
++from psycopg_pool import ConnectionPool
++
++
++def _configure(conn):
++    register_vector(conn)
++
++
++def make_pool(database_url: str, min_size: int, max_size: int, timeout: float) -> ConnectionPool:
++    # open(wait=False): the service starts even if the DB is down; /health/ready reports it.
++    pool = ConnectionPool(
++        database_url, min_size=min_size, max_size=max_size, timeout=timeout,
++        configure=_configure, open=False,
++    )
++    pool.open(wait=False)
++    return pool
++
++
++UPSERT = """
++INSERT INTO legal_chunks (content_hash, document_id, title, document_type, section, text,
++    source_url, authority, official_source, jurisdiction, language, effective_from, reviewed_on, embedding)
++VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
++ON CONFLICT (content_hash) DO UPDATE SET
++    title=EXCLUDED.title, document_type=EXCLUDED.document_type, source_url=EXCLUDED.source_url,
++    authority=EXCLUDED.authority, official_source=EXCLUDED.official_source,
++    jurisdiction=EXCLUDED.jurisdiction, language=EXCLUDED.language,
++    effective_from=EXCLUDED.effective_from, reviewed_on=EXCLUDED.reviewed_on,
++    embedding=EXCLUDED.embedding, updated_at=now()
++RETURNING (xmax = 0) AS inserted
++"""
++
++
++def upsert_chunks(pool, rows) -> tuple[int, int]:
++    """rows: list of (ChunkIn, normalised_embedding). One transaction; re-running never duplicates."""
++    inserted = updated = 0
++    with pool.connection() as conn:
++        with conn.transaction():
++            for chunk, emb in rows:
++                cur = conn.execute(UPSERT, (
++                    chunk.content_hash, chunk.document_id, chunk.title, chunk.document_type, chunk.section,
++                    chunk.text, chunk.source_url, chunk.authority, chunk.official_source, chunk.jurisdiction,
++                    chunk.language, chunk.effective_from, chunk.reviewed_on, Vector(emb),
++                ))
++                if cur.fetchone()[0]:
++                    inserted += 1
++                else:
++                    updated += 1
++    return inserted, updated
++
++
++def search(pool, emb, top_k, min_score, language, official_only):
++    filters, fparams = [], []
++    if language:
++        filters.append("language = %s")
++        fparams.append(language)
++    if official_only:
++        filters.append("official_source")
++    clause = ("WHERE " + " AND ".join(filters)) if filters else ""
++    sql = f"""
++        SELECT * FROM (
++            SELECT id, document_id, title, document_type, section, text, source_url, authority,
++                   official_source, jurisdiction, language, effective_from, reviewed_on,
++                   (source_url <> '' AND authority <> '') AS citation_complete,
++                   1 - (embedding <=> %s) AS score
++            FROM legal_chunks {clause}
++            ORDER BY embedding <=> %s
++            LIMIT %s
++        ) t WHERE score >= %s ORDER BY score DESC
++    """
++    vec = Vector(emb)
++    # placeholder order in the SQL text: score-vector, filters..., order-vector, limit, min_score
++    params = [vec, *fparams, vec, top_k, min_score]
++    with pool.connection() as conn:
++        with conn.cursor(row_factory=dict_row) as cur:
++            return cur.execute(sql, params).fetchall()
++
++
++def ready_check(pool, expected_dim: int) -> dict:
++    with pool.connection() as conn:
++        conn.execute("SELECT 1")
++        ext = conn.execute("SELECT 1 FROM pg_extension WHERE extname='vector'").fetchone()
++        row = conn.execute(
++            "SELECT a.atttypmod FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid "
++            "WHERE c.relname='legal_chunks' AND a.attname='embedding' AND NOT a.attisdropped"
++        ).fetchone()
++        count = conn.execute("SELECT count(*) FROM legal_chunks").fetchone()[0] if row else 0
++    return {"pgvector": bool(ext), "table": bool(row), "column_dim": row[0] if row else None,
++            "dim_ok": bool(row) and row[0] == expected_dim, "chunks": count}
+diff --git a/services/rag-api/app/schema.sql b/services/rag-api/app/schema.sql
+new file mode 100644
+index 0000000..f01cb02
+--- /dev/null
++++ b/services/rag-api/app/schema.sql
+@@ -0,0 +1,26 @@
++-- Shared LEGAL knowledge only. Private user documents must never be stored here.
++CREATE EXTENSION IF NOT EXISTS vector;
++
++CREATE TABLE IF NOT EXISTS legal_chunks (
++    id              BIGSERIAL PRIMARY KEY,
++    content_hash    CHAR(64)  NOT NULL UNIQUE,   -- sha256(document_id|section|text): idempotent ingest
++    document_id     TEXT      NOT NULL,
++    title           TEXT      NOT NULL,
++    document_type   TEXT      NOT NULL,
++    section         TEXT      NOT NULL,
++    text            TEXT      NOT NULL,
++    source_url      TEXT      NOT NULL DEFAULT '',
++    authority       TEXT      NOT NULL DEFAULT '',
++    official_source BOOLEAN   NOT NULL DEFAULT FALSE,
++    jurisdiction    TEXT      NOT NULL DEFAULT '',
++    language        TEXT      NOT NULL DEFAULT 'en',
++    effective_from  DATE,
++    reviewed_on     DATE,
++    embedding       vector(384) NOT NULL,
++    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
++    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
++);
++
++CREATE INDEX IF NOT EXISTS legal_chunks_embedding_hnsw
++    ON legal_chunks USING hnsw (embedding vector_cosine_ops);
++CREATE INDEX IF NOT EXISTS legal_chunks_document_id_idx ON legal_chunks (document_id);
+diff --git a/services/rag-api/requirements-dev.txt b/services/rag-api/requirements-dev.txt
+new file mode 100644
+index 0000000..e3fcd49
+--- /dev/null
++++ b/services/rag-api/requirements-dev.txt
+@@ -0,0 +1,3 @@
++-r requirements.txt
++pytest>=8
++httpx>=0.27
+diff --git a/services/rag-api/requirements.txt b/services/rag-api/requirements.txt
+new file mode 100644
+index 0000000..b53e9e8
+--- /dev/null
++++ b/services/rag-api/requirements.txt
+@@ -0,0 +1,7 @@
++fastapi==0.143.0
++uvicorn[standard]>=0.30
++psycopg[binary,pool]>=3.2
++pgvector>=0.3
++pydantic-settings>=2.4
++# optional, only if EMBEDDER=e5-small:
++# sentence-transformers>=3.0
+diff --git a/services/rag-api/scripts/init_db.py b/services/rag-api/scripts/init_db.py
+new file mode 100644
+index 0000000..b373ab1
+--- /dev/null
++++ b/services/rag-api/scripts/init_db.py
+@@ -0,0 +1,10 @@
++"""Apply app/schema.sql (idempotent). Usage: DATABASE_URL=... python -m scripts.init_db"""
++import os
++import pathlib
++
++import psycopg
++
++sql = (pathlib.Path(__file__).resolve().parent.parent / "app" / "schema.sql").read_text()
++with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
++    conn.execute(sql)
++print("schema applied")
+diff --git a/services/rag-api/scripts/load_embedded_chunks.py b/services/rag-api/scripts/load_embedded_chunks.py
+new file mode 100644
+index 0000000..a562443
+--- /dev/null
++++ b/services/rag-api/scripts/load_embedded_chunks.py
+@@ -0,0 +1,26 @@
++"""Load ai/legal_sources/embedded_chunks.json into pgvector. Idempotent: re-running adds no duplicates.
++Usage: DATABASE_URL=... SERVICE_API_KEY=<32+ chars> python -m scripts.load_embedded_chunks [path]"""
++import json
++import pathlib
++import sys
++
++from app import repo
++from app.config import get_settings
++from app.models import ChunkIn, prepare_embedding
++
++default = pathlib.Path(__file__).resolve().parents[3] / "ai" / "legal_sources" / "embedded_chunks.json"
++path = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else default
++settings = get_settings()
++raw = json.loads(path.read_text(encoding="utf-8"))
++rows = []
++for i, item in enumerate(raw):
++    chunk = ChunkIn(**item)
++    rows.append((chunk, prepare_embedding(chunk.embedding, settings.embedding_dim)))
++pool = repo.make_pool(settings.database_url, 1, 2, settings.db_acquire_timeout)
++inserted = updated = 0
++for start in range(0, len(rows), settings.max_ingest_batch):
++    a, b = repo.upsert_chunks(pool, rows[start:start + settings.max_ingest_batch])
++    inserted, updated = inserted + a, updated + b
++incomplete = sum(1 for c, _ in rows if not (c.source_url and c.authority))
++print(f"loaded {len(rows)} chunks: inserted={inserted} updated={updated} citation_incomplete={incomplete}")
++pool.close()
+diff --git a/services/rag-api/tests/__init__.py b/services/rag-api/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/services/rag-api/tests/conftest.py b/services/rag-api/tests/conftest.py
+new file mode 100644
+index 0000000..a6eaf82
+--- /dev/null
++++ b/services/rag-api/tests/conftest.py
+@@ -0,0 +1,61 @@
++import json
++import os
++import pathlib
++
++import psycopg
++import pytest
++from fastapi.testclient import TestClient
++
++from app.config import Settings
++from app.main import create_app
++
++DB_URL = os.environ.get("TEST_DATABASE_URL", "postgresql://rag_app:testpw@127.0.0.1:5432/alimony_rag_test")
++API_KEY = "k" * 40
++CHUNKS_FILE = pathlib.Path(__file__).resolve().parents[3] / "ai" / "legal_sources" / "embedded_chunks.json"
++
++
++def make_settings(**kw) -> Settings:
++    base = dict(database_url=DB_URL, service_api_key=API_KEY, db_acquire_timeout=2.0)
++    base.update(kw)
++    return Settings(**base)
++
++
++@pytest.fixture(scope="session", autouse=True)
++def schema():
++    try:
++        with psycopg.connect(DB_URL, autocommit=True, connect_timeout=3) as conn:
++            conn.execute((pathlib.Path(__file__).resolve().parents[1] / "app" / "schema.sql").read_text())
++    except psycopg.OperationalError:
++        pytest.skip("test database not reachable (set TEST_DATABASE_URL)", allow_module_level=False)
++
++
++@pytest.fixture(autouse=True)
++def empty_table(schema):
++    with psycopg.connect(DB_URL, autocommit=True) as conn:
++        conn.execute("TRUNCATE legal_chunks RESTART IDENTITY")
++
++
++@pytest.fixture
++def client():
++    with TestClient(create_app(make_settings()), raise_server_exceptions=False) as c:
++        yield c
++
++
++@pytest.fixture
++def auth():
++    return {"X-API-Key": API_KEY}
++
++
++@pytest.fixture(scope="session")
++def real_chunks():
++    return json.loads(CHUNKS_FILE.read_text(encoding="utf-8"))
++
++
++def fake_chunk(i=0, **kw):
++    vec = [0.0] * 384
++    vec[i % 384] = 1.0
++    c = dict(document_id=f"DOC_{i}", title=f"Title {i}", document_type="statute", section="content",
++             text=f"text {i}", source_url="https://example.org/x", authority="Gov", official_source=True,
++             jurisdiction="India", language="en", embedding=vec)
++    c.update(kw)
++    return c
+diff --git a/services/rag-api/tests/test_api.py b/services/rag-api/tests/test_api.py
+new file mode 100644
+index 0000000..f5f498c
+--- /dev/null
++++ b/services/rag-api/tests/test_api.py
+@@ -0,0 +1,188 @@
++import psycopg
++
++from tests.conftest import API_KEY, DB_URL, fake_chunk, make_settings
++
++
++def count():
++    with psycopg.connect(DB_URL) as conn:
++        return conn.execute("SELECT count(*) FROM legal_chunks").fetchone()[0]
++
++
++def ingest(client, auth, chunks):
++    return client.post("/v1/ingest", json={"chunks": chunks}, headers=auth)
++
++
++# ---------- health & auth ----------
++def test_health_and_ready(client):
++    assert client.get("/health").json() == {"status": "ok"}
++    r = client.get("/health/ready")
++    assert r.status_code == 200
++    body = r.json()
++    assert body["status"] == "ready" and body["pgvector"] and body["dim_ok"] and body["column_dim"] == 384
++
++
++def test_docs_and_schema_not_public(client):
++    for p in ("/docs", "/redoc", "/openapi.json"):
++        assert client.get(p).status_code == 404
++
++
++def test_endpoints_require_api_key(client):
++    for headers in ({}, {"X-API-Key": "wrong" * 10}):
++        assert client.post("/v1/search", json={"query": "x"}, headers=headers).status_code == 401
++        assert client.post("/v1/ingest", json={"chunks": [fake_chunk()]}, headers=headers).status_code == 401
++    assert count() == 0
++
++
++def test_ready_reports_503_when_database_down():
++    from fastapi.testclient import TestClient
++
++    from app.main import create_app
++
++    bad = make_settings(database_url="postgresql://rag_app:testpw@127.0.0.1:1/none", db_acquire_timeout=1.0)
++    with TestClient(create_app(bad), raise_server_exceptions=False) as c:
++        assert c.get("/health").status_code == 200          # liveness unaffected
++        assert c.get("/health/ready").status_code == 503    # readiness fails
++        r = c.post("/v1/search", json={"embedding": [0.1] * 384}, headers={"X-API-Key": API_KEY})
++        assert r.status_code == 503 and r.json()["error"]["code"] == "database_unavailable"
++
++
++# ---------- ingest ----------
++def test_ingest_is_idempotent(client, auth):
++    chunks = [fake_chunk(i) for i in range(5)]
++    first = ingest(client, auth, chunks).json()
++    second = ingest(client, auth, chunks).json()
++    assert (first["inserted"], first["updated"]) == (5, 0)
++    assert (second["inserted"], second["updated"]) == (0, 5)
++    assert count() == 5
++
++
++def test_ingest_rejects_bad_batch_atomically(client, auth):
++    good, bad = fake_chunk(1), fake_chunk(2, embedding=[0.1] * 12)
++    r = ingest(client, auth, [good, bad])
++    assert r.status_code == 422 and r.json()["error"]["code"] == "embedding_dimension_mismatch"
++    assert count() == 0                                   # nothing partially written
++
++
++def test_ingest_rejects_javascript_source_url_and_zero_vector(client, auth):
++    assert ingest(client, auth, [fake_chunk(1, source_url="javascript:alert(1)")]).status_code == 422
++    assert ingest(client, auth, [fake_chunk(1, embedding=[0.0] * 384)]).json()["error"]["code"] == "embedding_zero_vector"
++    assert count() == 0
++
++
++def test_ingest_batch_limit(client, auth):
++    r = ingest(client, auth, [fake_chunk(i) for i in range(201)])
++    assert r.status_code == 422 and r.json()["error"]["code"] == "batch_too_large"
++
++
++def test_ingest_flags_incomplete_citations(client, auth):
++    r = ingest(client, auth, [fake_chunk(1, source_url=""), fake_chunk(2)]).json()
++    assert r["citation_incomplete"] == 1
++
++
++# ---------- search ----------
++def test_search_on_empty_table_returns_empty_list(client, auth):
++    r = client.post("/v1/search", json={"embedding": [0.1] * 384}, headers=auth)
++    assert r.status_code == 200 and r.json()["results"] == [] and r.json()["count"] == 0
++
++
++def test_search_returns_nearest_first_with_source_metadata(client, auth):
++    chunks = [fake_chunk(i) for i in range(10)]
++    ingest(client, auth, chunks)
++    r = client.post("/v1/search", json={"embedding": chunks[3]["embedding"], "top_k": 3}, headers=auth).json()
++    assert r["results"][0]["document_id"] == "DOC_3" and r["results"][0]["score"] > 0.999
++    assert r["untrusted_content"] is True and r["count"] == 3
++    src = r["results"][0]["source"]
++    assert src["url"] == "https://example.org/x" and src["official"] is True
++    assert r["results"][0]["citation_complete"] is True
++
++
++def test_search_filters_and_min_score(client, auth):
++    ingest(client, auth, [fake_chunk(1), fake_chunk(2, official_source=False), fake_chunk(3, language="hi")])
++    q = fake_chunk(1)["embedding"]
++    only_official = client.post("/v1/search", json={"embedding": q, "official_only": True, "top_k": 10}, headers=auth).json()
++    assert {x["document_id"] for x in only_official["results"]} == {"DOC_1", "DOC_3"}
++    hindi = client.post("/v1/search", json={"embedding": q, "language": "hi", "top_k": 10}, headers=auth).json()
++    assert [x["document_id"] for x in hindi["results"]] == ["DOC_3"]
++    strict = client.post("/v1/search", json={"embedding": q, "min_score": 0.9, "top_k": 10}, headers=auth).json()
++    assert [x["document_id"] for x in strict["results"]] == ["DOC_1"]
++
++
++def test_search_rejects_invalid_embeddings_without_echoing_them(client, auth):
++    for emb, code in (([0.1] * 10, "embedding_dimension_mismatch"), ([0.0] * 384, "embedding_zero_vector")):
++        r = client.post("/v1/search", json={"embedding": emb}, headers=auth)
++        assert r.status_code == 422 and r.json()["error"]["code"] == code
++    r = client.post("/v1/search", json={"embedding": ["a"] * 384}, headers=auth)
++    assert r.status_code == 422 and "a" * 5 not in r.text and r.json()["error"]["code"] == "validation_error"
++    r = client.post("/v1/search", content='{"embedding": [NaN, 1]}', headers={**auth, "Content-Type": "application/json"})
++    assert r.status_code == 422
++
++
++def test_search_validation_errors(client, auth):
++    assert client.post("/v1/search", json={}, headers=auth).status_code == 422
++    assert client.post("/v1/search", json={"query": "x", "embedding": [0.1] * 384}, headers=auth).status_code == 422
++    r = client.post("/v1/search", json={"embedding": [0.1] * 384, "top_k": 21}, headers=auth)
++    assert r.status_code == 422 and r.json()["error"]["code"] == "top_k_too_large"
++
++
++def test_text_query_without_embedder_gives_clear_503(client, auth):
++    r = client.post("/v1/search", json={"query": "interim maintenance"}, headers=auth)
++    assert r.status_code == 503 and r.json()["error"]["code"] == "embedder_unavailable"
++
++
++def test_text_query_with_embedder_works(auth):
++    from fastapi.testclient import TestClient
++
++    from app.main import create_app
++
++    class Fake:
++        name = "fake"
++
++        def embed_query(self, text):
++            return fake_chunk(4)["embedding"]
++
++    with TestClient(create_app(make_settings(), embedder=Fake())) as c:
++        ingest(c, auth, [fake_chunk(i) for i in range(6)])
++        r = c.post("/v1/search", json={"query": "anything"}, headers=auth).json()
++        assert r["results"][0]["document_id"] == "DOC_4"
++
++
++# ---------- errors & privacy ----------
++def test_unexpected_errors_do_not_leak_internals(auth, monkeypatch):
++    from fastapi.testclient import TestClient
++
++    from app import main
++    from app.main import create_app
++
++    def boom(*a, **k):
++        raise RuntimeError("SELECT secret FROM users; password=hunter2")
++
++    monkeypatch.setattr(main.repo, "search", boom)
++    with TestClient(create_app(make_settings()), raise_server_exceptions=False) as c:
++        r = c.post("/v1/search", json={"embedding": [0.1] * 384}, headers=auth)
++    assert r.status_code == 500 and r.json()["error"]["code"] == "internal_error"
++    assert "hunter2" not in r.text and "SELECT" not in r.text and "Traceback" not in r.text
++    assert r.json()["error"]["request_id"] == r.headers["X-Request-ID"]
++
++
++def test_request_id_is_sanitised_and_responses_not_cached(client):
++    r = client.get("/health", headers={"X-Request-ID": "bad id\r\nX-Injected: 1"})
++    assert "X-Injected" not in r.headers and len(r.headers["X-Request-ID"]) >= 8
++    assert r.headers["Cache-Control"] == "no-store" and r.headers["X-Content-Type-Options"] == "nosniff"
++    ok = client.get("/health", headers={"X-Request-ID": "abc-12345678"})
++    assert ok.headers["X-Request-ID"] == "abc-12345678"
++
++
++def test_oversized_body_rejected(client, auth):
++    r = client.post("/v1/ingest", content=b"x" * 5_000_100, headers={**auth, "Content-Type": "application/json"})
++    assert r.status_code == 413
++
++
++# ---------- the real legal data ----------
++def test_real_chunks_load_and_self_retrieve(client, auth, real_chunks):
++    r = ingest(client, auth, real_chunks[:80]).json()
++    r2 = ingest(client, auth, real_chunks[:80]).json()
++    assert r["inserted"] == 80 and r2["inserted"] == 0 and count() == 80
++    for idx in (0, 17, 42, 79):
++        q = real_chunks[idx]
++        res = client.post("/v1/search", json={"embedding": q["embedding"], "top_k": 1}, headers=auth).json()["results"][0]
++        assert res["document_id"] == q["document_id"] and res["text"] == q["text"] and res["score"] > 0.999
+diff --git a/services/rag-api/tests/test_models.py b/services/rag-api/tests/test_models.py
+new file mode 100644
+index 0000000..6d27a5f
+--- /dev/null
++++ b/services/rag-api/tests/test_models.py
+@@ -0,0 +1,52 @@
++import pytest
++from pydantic import ValidationError
++
++from app.models import ChunkIn, EmbeddingError, SearchRequest, prepare_embedding
++from tests.conftest import fake_chunk
++
++
++def test_search_needs_exactly_one_input():
++    with pytest.raises(ValidationError):
++        SearchRequest()
++    with pytest.raises(ValidationError):
++        SearchRequest(query="x", embedding=[0.1] * 384)
++    assert SearchRequest(query="x").query == "x"
++
++
++def test_search_rejects_unknown_fields_and_bad_values():
++    with pytest.raises(ValidationError):
++        SearchRequest(query="x", sql="DROP TABLE legal_chunks")
++    with pytest.raises(ValidationError):
++        SearchRequest(query="x", top_k=0)
++    with pytest.raises(ValidationError):
++        SearchRequest(query="x", language="EN; DROP")
++    with pytest.raises(ValidationError):
++        SearchRequest(embedding=[float("nan")] * 384)
++
++
++@pytest.mark.parametrize("vec,code", [
++    ([0.1] * 10, "embedding_dimension_mismatch"),
++    ([0.0] * 384, "embedding_zero_vector"),
++    ([float("inf")] + [0.1] * 383, "embedding_not_finite"),
++])
++def test_prepare_embedding_errors(vec, code):
++    with pytest.raises(EmbeddingError) as e:
++        prepare_embedding(vec, 384)
++    assert e.value.code == code
++
++
++def test_prepare_embedding_normalises():
++    out = prepare_embedding([3.0, 4.0] + [0.0] * 382, 384)
++    assert abs(sum(x * x for x in out) - 1.0) < 1e-9
++
++
++@pytest.mark.parametrize("url", ["javascript:alert(1)", "data:text/html,<script>", "ftp://x", "//evil.com"])
++def test_chunk_rejects_non_http_source_urls(url):
++    with pytest.raises(ValidationError):
++        ChunkIn(**fake_chunk(source_url=url))
++
++
++def test_chunk_hash_is_stable_and_content_based():
++    a, b = ChunkIn(**fake_chunk(1)), ChunkIn(**fake_chunk(1, title="renamed"))
++    assert a.content_hash == b.content_hash
++    assert a.content_hash != ChunkIn(**fake_chunk(1, text="different")).content_hash
